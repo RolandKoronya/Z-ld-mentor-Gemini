@@ -1,27 +1,30 @@
 // tools/ingest.js (FAST SHARDING)
+// UPDATED: Now uses Google Gemini for embeddings
 import fs from "fs";
 import path from "path";
 import zlib from "zlib";
-import OpenAI from "openai";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 
 const SRC_DIR = path.join(process.cwd(), "kb");
 const OUT_PREFIX = "kb_store-"; // kb_store-000.json.gz, 001, ...
 
 // Tweakables
-const EMB_MODEL = "text-embedding-3-small"; // 1536-dim
+const EMB_MODEL = "text-embedding-004"; // Google's model (768-dim)
 const CHUNK_SIZE = 900;
 const CHUNK_OVERLAP = 150;
 const DECIMALS = 4;           // round embeddings for smaller files
-const SHARD_COUNT_TARGET = 2500; // ~2500 chunks per shard (fast + well under 100MB gz)
+const SHARD_COUNT_TARGET = 2500; // ~2500 chunks per shard
 
 // ——————————————————————————————————————
 
-if (!process.env.OPENAI_API_KEY) {
-  console.error("Missing OPENAI_API_KEY env var.");
+if (!process.env.GEMINI_API_KEY) {
+  console.error("Missing GEMINI_API_KEY env var.");
   process.exit(1);
 }
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+// Initialize Gemini
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const model = genAI.getGenerativeModel({ model: EMB_MODEL });
 
 function chunk(text, size = CHUNK_SIZE, overlap = CHUNK_OVERLAP) {
   const chunks = [];
@@ -57,6 +60,9 @@ function pad(n, width=3) {
   return String(n).padStart(width, "0");
 }
 
+// Helper to pause execution (to respect rate limits)
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 async function main() {
   const docs = loadTxtFiles();
   if (docs.length === 0) {
@@ -66,22 +72,42 @@ async function main() {
   console.log(`Embedding ${docs.length} chunks with ${EMB_MODEL}...`);
 
   const out = [];
+  // Gemini supports batch sizes up to 100. We keep 64 to be safe.
   const BATCH = 64;
+
   for (let i = 0; i < docs.length; i += BATCH) {
     const batch = docs.slice(i, i + BATCH);
-    const resp = await openai.embeddings.create({
-      model: EMB_MODEL,
-      input: batch.map(d => d.text)
-    });
-    resp.data.forEach((row, j) => {
-      out.push({
-        id: batch[j].id,
-        source: batch[j].source,
-        text: batch[j].text,
-        embedding: roundEmbedding(row.embedding)
+    
+    try {
+      // Prepare requests for Gemini batchEmbedContents
+      const requests = batch.map(d => ({
+        content: { role: "user", parts: [{ text: d.text }] },
+        taskType: "RETRIEVAL_DOCUMENT", // Optimized for search docs
+        title: d.source
+      }));
+
+      const result = await model.batchEmbedContents({ requests });
+      const embeddings = result.embeddings;
+
+      // Match results back to docs
+      embeddings.forEach((emb, j) => {
+        out.push({
+          id: batch[j].id,
+          source: batch[j].source,
+          text: batch[j].text,
+          embedding: roundEmbedding(emb.values) // Gemini returns .values
+        });
       });
-    });
-    console.log(`  → ${Math.min(i + BATCH, docs.length)} / ${docs.length}`);
+
+      console.log(`  → ${Math.min(i + BATCH, docs.length)} / ${docs.length}`);
+      
+      // Tiny pause to be kind to the Free Tier rate limits
+      await sleep(500); 
+
+    } catch (e) {
+      console.error(`Error in batch ${i}:`, e.message);
+      // Don't crash, just skip this batch or retry (optional)
+    }
   }
 
   // FAST SHARDING: split by count, gzip once per shard
@@ -96,11 +122,10 @@ async function main() {
     shardIdx += 1;
   }
 
-  console.log("Done. Sharded and compressed KB ready.");
+  console.log("Done. Sharded and compressed KB ready (Gemini format).");
 }
 
 main().catch(e => {
   console.error(e);
   process.exit(1);
 });
-

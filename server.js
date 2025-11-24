@@ -7,7 +7,6 @@ import cors from "cors";
 import dotenv from "dotenv";
 import rateLimit from "express-rate-limit";
 // We keep OpenAI import because your Retriever likely depends on it for embeddings
-import OpenAI from "openai"; 
 import { GoogleGenerativeAI } from "@google/generative-ai"; // 🆕 Google Import
 import fs from "fs";
 import path from "path";
@@ -202,7 +201,7 @@ const kb = loadKB(path.join(process.cwd(), "kb"));
 // ⚠️ Important: The retriever likely still uses OpenAI for embeddings.
 // Ensure OPENAI_API_KEY is still in your .env file.
 const retriever = createRetriever(kb, {
-  openaiApiKey: process.env.OPENAI_API_KEY,
+  geminiApiKey: process.env.GEMINI_API_KEY,
 });
 
 // Quick browser test: /search/debug?q=calendula
