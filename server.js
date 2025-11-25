@@ -1,15 +1,16 @@
 // server.js
 // Zöld Mentor — secure chat backend with per-session memory + external prompts + KB (RAG)
-// UPDATED: Fixed Model Name for Gemini 3 Pro (Preview Edition)
+// UPDATED: Powered by Gemini 3 Pro + Google Firestore (Long-Term Memory)
 
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import rateLimit from "express-rate-limit";
 import { GoogleGenerativeAI } from "@google/generative-ai"; 
+// 🆕 New Database Import
+import { Firestore } from "@google-cloud/firestore";
 import fs from "fs";
 import path from "path";
-import zlib from "zlib";
 
 // ⤵️ Imports for the hybrid KB retriever
 import { loadKB } from "./lib/kb_loader.js";
@@ -23,6 +24,10 @@ dotenv.config();
 const app = express();
 app.set("trust proxy", 1);
 app.use(express.json({ limit: "1mb" }));
+
+// Initialize Firestore (Google's Database)
+// Google Cloud Run automatically logs in using your project credentials.
+const db = new Firestore();
 
 // CORS: only allow your sites
 const allowedOrigins = [
@@ -68,14 +73,11 @@ function auth(req, res, next) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 2) AI Clients (Gemini 3 Pro - Preview)
+// 2) AI Clients
 // ─────────────────────────────────────────────────────────────────────────────
-
-// Initialize Google Gemini Client
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-// ⚠️ IMPORTANT: We use the "-preview" suffix because the model launched Nov 18, 2025.
-// If this fails in your region (Europe), try "gemini-2.5-pro" as a fallback.
+// Use the Preview model (Nov 2025 release)
 const MODEL_NAME = "gemini-3-pro-preview"; 
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -89,11 +91,7 @@ let cachedSystemPrompt = null;
 let cachedPromptMtime = 0;
 
 function readFileIfExists(p) {
-  try {
-    return fs.readFileSync(p, "utf8");
-  } catch {
-    return "";
-  }
+  try { return fs.readFileSync(p, "utf8"); } catch { return ""; }
 }
 
 function buildSystemPrompt() {
@@ -102,15 +100,11 @@ function buildSystemPrompt() {
     if (!cachedSystemPrompt || stat.mtimeMs !== cachedPromptMtime) {
       cachedSystemPrompt = readFileIfExists(PROMPT_PATH);
       cachedPromptMtime = stat.mtimeMs;
-      console.log(
-        `[PROMPT] Loaded base.hu.md (${PROMPT_PATH}, ${cachedSystemPrompt.length} chars)`
-      );
+      console.log(`[PROMPT] Loaded base.hu.md (${PROMPT_PATH}, ${cachedSystemPrompt.length} chars)`);
     }
   } catch (e) {
     console.warn(`[PROMPT] Could not read ${PROMPT_PATH}: ${e.message}`);
-    cachedSystemPrompt =
-      cachedSystemPrompt ||
-      "Te vagy a Zöld Mentor. Válaszolj magyarul, világosan.";
+    cachedSystemPrompt = cachedSystemPrompt || "Te vagy a Zöld Mentor. Válaszolj magyarul, világosan.";
   }
   return cachedSystemPrompt;
 }
@@ -123,37 +117,64 @@ app.post("/admin/reload-prompts", auth, (_req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 4) Conversation memory
+// 4) PERMANENT DATABASE MEMORY (Firestore)
 // ─────────────────────────────────────────────────────────────────────────────
-const SESSIONS = new Map();
 const MAX_HISTORY = 12;
 
+/**
+ * Generates a safe Document ID for Firestore
+ * Firestore IDs cannot contain "/" characters.
+ */
 function getConversationKey(req) {
+  let rawKey = "";
   const userId = req.headers["x-user-id"];
-  if (userId) return `user:${userId}`;
-  const sessionId = req.headers["x-session-id"];
-  if (sessionId) return `session:${sessionId}`;
-  return `ip:${req.ip || "anon"}`;
+  if (userId) rawKey = `user:${userId}`;
+  else {
+    const sessionId = req.headers["x-session-id"];
+    if (sessionId) rawKey = `session:${sessionId}`;
+    else rawKey = `ip:${req.ip || "anon"}`;
+  }
+  // Sanitize key just in case
+  return rawKey.replace(/\//g, "_");
 }
 
-function getHistory(convKey) {
-  if (!SESSIONS.has(convKey)) SESSIONS.set(convKey, []);
-  return SESSIONS.get(convKey);
+/**
+ * Reads history from Google Firestore
+ */
+async function loadSession(key) {
+  try {
+    const doc = await db.collection("sessions").doc(key).get();
+    if (!doc.exists) return [];
+    return doc.data().messages || [];
+  } catch (e) {
+    console.error("⚠️ Firestore Read Error:", e.message);
+    return [];
+  }
 }
 
-function pushToHistory(convKey, msg) {
-  const arr = getHistory(convKey);
-  arr.push(msg);
-  if (arr.length > MAX_HISTORY) arr.splice(0, arr.length - MAX_HISTORY);
+/**
+ * Saves history to Google Firestore
+ */
+async function saveSession(key, messages) {
+  try {
+    // Overwrite the document with the new array
+    await db.collection("sessions").doc(key).set({
+      messages: messages,
+      updatedAt: new Date()
+    });
+  } catch (e) {
+    console.error("⚠️ Firestore Write Error:", e.message);
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 4b) Conversation history endpoint
 // ─────────────────────────────────────────────────────────────────────────────
-app.get("/history", auth, (req, res) => {
+app.get("/history", auth, async (req, res) => {
   try {
     const convKey = getConversationKey(req);
-    const hist = getHistory(convKey) || [];
+    // 🆕 Async load from DB
+    const hist = await loadSession(convKey);
 
     const messages = hist
       .filter(
@@ -174,29 +195,20 @@ app.get("/history", auth, (req, res) => {
   }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 4c) Analytics endpoint
-// ─────────────────────────────────────────────────────────────────────────────
 app.post("/log", auth, (req, res) => {
   try {
     const payload = req.body || {};
     console.log("📈 ZM analytics:", JSON.stringify(payload));
-  } catch (e) {
-    console.warn("⚠️ /log parse error:", e.message);
-  }
+  } catch (e) { console.warn("⚠️ /log parse error:", e.message); }
   res.json({ ok: true });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 5) NEW KB SYSTEM — hybrid retriever
+// 5) KB SYSTEM
 // ─────────────────────────────────────────────────────────────────────────────
 const kb = loadKB(path.join(process.cwd(), "kb"));
+const retriever = createRetriever(kb, { geminiApiKey: process.env.GEMINI_API_KEY });
 
-const retriever = createRetriever(kb, {
-  geminiApiKey: process.env.GEMINI_API_KEY,
-});
-
-// Quick browser test: /search/debug?q=calendula
 app.get("/search/debug", async (req, res) => {
   try {
     const q = req.query.q || "calendula";
@@ -214,10 +226,7 @@ app.get("/search/debug", async (req, res) => {
 });
 
 app.get("/kb-stats", auth, (_req, res) => {
-  res.json({
-    ok: true,
-    chunks: kb.chunks ? kb.chunks.length : 0,
-  });
+  res.json({ ok: true, chunks: kb.chunks ? kb.chunks.length : 0 });
 });
 
 app.get("/system-prompt-preview", auth, (_req, res) => {
@@ -226,35 +235,31 @@ app.get("/system-prompt-preview", auth, (_req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 6) Chat endpoint (Powered by Gemini 3 Pro Preview)
+// 6) Chat endpoint (Gemini 3 + Firestore Memory)
 // ─────────────────────────────────────────────────────────────────────────────
 app.post("/chat", auth, async (req, res) => {
   try {
     const body = req.body || {};
     let incoming = Array.isArray(body.messages) ? body.messages : [];
     
-    // Fallback for simple request
     if (!incoming.length && body.message) {
       incoming = [{ role: "user", content: String(body.message) }];
     }
-    if (!incoming.length)
-      return res.status(400).json({ error: "Provide messages or message." });
+    if (!incoming.length) return res.status(400).json({ error: "Provide messages." });
 
-    // Extract the latest user message
     const lastUser = [...incoming].reverse().find((m) => m.role === "user");
     const userText = lastUser ? String(lastUser.content || "") : "";
-    if (!userText)
-      return res.status(400).json({ error: "Missing user message." });
+    if (!userText) return res.status(400).json({ error: "Missing user message." });
 
+    // 1. Load History from DB
     const convKey = getConversationKey(req);
-    const history = getHistory(convKey);
+    const history = await loadSession(convKey);
 
-    // 1. Retrieve relevant chunks (Search KB)
+    // 2. Search KB
     const kbHits = await retriever.search(userText, { k: 6 });
     
-    // 2. Build System Prompt for Gemini
+    // 3. Build Prompt
     const baseSystemPromptHu = buildSystemPrompt();
-    
     let contextBlock = "";
     if (kbHits && kbHits.length > 0) {
       const sourcesText = kbHits
@@ -267,7 +272,7 @@ app.post("/chat", auth, async (req, res) => {
 
     const finalSystemInstruction = `${baseSystemPromptHu}${contextBlock}`;
 
-    // 3. Convert History to Gemini Format
+    // 4. Convert History for Gemini
     const googleHistory = history.map((m) => {
       return {
         role: m.role === "assistant" ? "model" : "user",
@@ -275,33 +280,36 @@ app.post("/chat", auth, async (req, res) => {
       };
     });
 
-    // 4. Start Gemini 3 Session
-    // We use the constant MODEL_NAME defined at the top
+    // 5. Generate Answer
     const model = genAI.getGenerativeModel({ 
       model: MODEL_NAME,
       systemInstruction: finalSystemInstruction 
     });
 
-    const chatSession = model.startChat({
-      history: googleHistory,
-    });
-
-    // 5. Send Message
+    const chatSession = model.startChat({ history: googleHistory });
     const result = await chatSession.sendMessage(userText);
-    const response = await result.response;
-    const reply = response.text();
+    const reply = result.response.text();
 
-    // 6. Save to local history
-    pushToHistory(convKey, { role: "user", content: userText });
-    pushToHistory(convKey, { role: "assistant", content: reply });
+    // 6. Save NEW History to DB (User msg + Bot reply)
+    // We append the new exchange to the existing history
+    const updatedHistory = [
+      ...history, 
+      { role: "user", content: userText }, 
+      { role: "assistant", content: reply }
+    ];
+
+    // Sliding Window: Keep only the last N messages to save costs
+    const trimmedHistory = updatedHistory.slice(-MAX_HISTORY);
+
+    // 🆕 Write back to Firestore
+    await saveSession(convKey, trimmedHistory);
 
     res.json({ ok: true, answer: reply });
 
   } catch (e) {
     console.error("❌ /chat error:", e);
-    // Explicit error logging for Model Name issues
     if (e.message && e.message.includes("404")) {
-       console.error(`⚠️ Model '${MODEL_NAME}' not found. It might be region-locked or retired.`);
+       console.error(`⚠️ Model '${MODEL_NAME}' not found. Check availability.`);
     }
     res.status(500).json({ error: "Error connecting to AI backend." });
   }
@@ -316,5 +324,5 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`✅ Zöld Mentor API listening on port ${PORT}`);
   console.log(`🧠 AI Brain: ${MODEL_NAME}`);
-  console.log(`📂 KB loaded with ${kb.chunks.length} chunks`);
+  console.log(`💾 Memory: Google Firestore (Persistent)`);
 });
