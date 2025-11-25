@@ -1,13 +1,12 @@
 // server.js
 // Zöld Mentor — secure chat backend with per-session memory + external prompts + KB (RAG)
-// UPDATED: Powered by Gemini 3 Pro + Google Firestore (Long-Term Memory)
+// UPDATED: Gemini 3 Pro + Firestore + Extended History for Search
 
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import rateLimit from "express-rate-limit";
 import { GoogleGenerativeAI } from "@google/generative-ai"; 
-// 🆕 New Database Import
 import { Firestore } from "@google-cloud/firestore";
 import fs from "fs";
 import path from "path";
@@ -26,7 +25,6 @@ app.set("trust proxy", 1);
 app.use(express.json({ limit: "1mb" }));
 
 // Initialize Firestore (Google's Database)
-// Google Cloud Run automatically logs in using your project credentials.
 const db = new Firestore();
 
 // CORS: only allow your sites
@@ -73,11 +71,12 @@ function auth(req, res, next) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 2) AI Clients
+// 2) AI Clients (Gemini 3 Pro - Preview)
 // ─────────────────────────────────────────────────────────────────────────────
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 // Use the Preview model (Nov 2025 release)
+// Fallback to "gemini-2.5-pro" if preview is unavailable in your region.
 const MODEL_NAME = "gemini-3-pro-preview"; 
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -119,12 +118,10 @@ app.post("/admin/reload-prompts", auth, (_req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // 4) PERMANENT DATABASE MEMORY (Firestore)
 // ─────────────────────────────────────────────────────────────────────────────
-const MAX_HISTORY = 12;
+// 🆕 UPDATED LIMITS:
+const MAX_CONTEXT = 12; // Only send last 12 messages to AI (Cheap/Fast)
+const MAX_STORAGE = 50; // Keep last 50 messages in DB (For History Search)
 
-/**
- * Generates a safe Document ID for Firestore
- * Firestore IDs cannot contain "/" characters.
- */
 function getConversationKey(req) {
   let rawKey = "";
   const userId = req.headers["x-user-id"];
@@ -134,13 +131,10 @@ function getConversationKey(req) {
     if (sessionId) rawKey = `session:${sessionId}`;
     else rawKey = `ip:${req.ip || "anon"}`;
   }
-  // Sanitize key just in case
+  // Sanitize key for Firestore
   return rawKey.replace(/\//g, "_");
 }
 
-/**
- * Reads history from Google Firestore
- */
 async function loadSession(key) {
   try {
     const doc = await db.collection("sessions").doc(key).get();
@@ -152,12 +146,8 @@ async function loadSession(key) {
   }
 }
 
-/**
- * Saves history to Google Firestore
- */
 async function saveSession(key, messages) {
   try {
-    // Overwrite the document with the new array
     await db.collection("sessions").doc(key).set({
       messages: messages,
       updatedAt: new Date()
@@ -173,7 +163,7 @@ async function saveSession(key, messages) {
 app.get("/history", auth, async (req, res) => {
   try {
     const convKey = getConversationKey(req);
-    // 🆕 Async load from DB
+    // Loads the full 50 stored messages so search works on older items
     const hist = await loadSession(convKey);
 
     const messages = hist
@@ -251,9 +241,9 @@ app.post("/chat", auth, async (req, res) => {
     const userText = lastUser ? String(lastUser.content || "") : "";
     if (!userText) return res.status(400).json({ error: "Missing user message." });
 
-    // 1. Load History from DB
+    // 1. Load FULL History from DB (up to 50 messages)
     const convKey = getConversationKey(req);
-    const history = await loadSession(convKey);
+    const fullHistory = await loadSession(convKey);
 
     // 2. Search KB
     const kbHits = await retriever.search(userText, { k: 6 });
@@ -272,8 +262,11 @@ app.post("/chat", auth, async (req, res) => {
 
     const finalSystemInstruction = `${baseSystemPromptHu}${contextBlock}`;
 
-    // 4. Convert History for Gemini
-    const googleHistory = history.map((m) => {
+    // 4. Convert History for Gemini (Use only last MAX_CONTEXT messages)
+    // 🆕 Optimization: We only send the last 12 messages to the Brain to save money.
+    const recentHistory = fullHistory.slice(-MAX_CONTEXT);
+    
+    const googleHistory = recentHistory.map((m) => {
       return {
         role: m.role === "assistant" ? "model" : "user",
         parts: [{ text: m.content }],
@@ -290,19 +283,18 @@ app.post("/chat", auth, async (req, res) => {
     const result = await chatSession.sendMessage(userText);
     const reply = result.response.text();
 
-    // 6. Save NEW History to DB (User msg + Bot reply)
-    // We append the new exchange to the existing history
+    // 6. Save NEW History to DB
+    // 🆕 We append to fullHistory, then trim to MAX_STORAGE (50)
     const updatedHistory = [
-      ...history, 
+      ...fullHistory, 
       { role: "user", content: userText }, 
       { role: "assistant", content: reply }
     ];
 
-    // Sliding Window: Keep only the last N messages to save costs
-    const trimmedHistory = updatedHistory.slice(-MAX_HISTORY);
+    const historyToSave = updatedHistory.slice(-MAX_STORAGE);
 
-    // 🆕 Write back to Firestore
-    await saveSession(convKey, trimmedHistory);
+    // Async write (fire and forget) so we don't delay the response
+    saveSession(convKey, historyToSave);
 
     res.json({ ok: true, answer: reply });
 
@@ -324,5 +316,5 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`✅ Zöld Mentor API listening on port ${PORT}`);
   console.log(`🧠 AI Brain: ${MODEL_NAME}`);
-  console.log(`💾 Memory: Google Firestore (Persistent)`);
+  console.log(`💾 Memory: Firestore (Context: ${MAX_CONTEXT}, Storage: ${MAX_STORAGE})`);
 });
