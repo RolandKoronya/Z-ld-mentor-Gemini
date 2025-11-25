@@ -1,6 +1,6 @@
 // server.js
 // Zöld Mentor — secure chat backend with per-session memory + external prompts + KB (RAG)
-// UPDATED: Now powered by Gemini 3 Pro (The "Smartest" Model)
+// UPDATED: Fixed Model Name for Gemini 3 Pro (Preview Edition)
 
 import express from "express";
 import cors from "cors";
@@ -68,16 +68,15 @@ function auth(req, res, next) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 2) AI Clients (Gemini 3 Pro)
+// 2) AI Clients (Gemini 3 Pro - Preview)
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Initialize Google Gemini Client
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-// We define the model here to check connectivity, but we instantiate per-request in /chat
-// Using "gemini-3-pro" for best reasoning and instruction following.
-// If you ever need to save money/speed, switch this string back to "gemini-2.5-flash"
-const MODEL_NAME = "gemini-3-pro"; 
+// ⚠️ IMPORTANT: We use the "-preview" suffix because the model launched Nov 18, 2025.
+// If this fails in your region (Europe), try "gemini-2.5-pro" as a fallback.
+const MODEL_NAME = "gemini-3-pro-preview"; 
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 3) External prompt loader
@@ -124,7 +123,7 @@ app.post("/admin/reload-prompts", auth, (_req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 4) Conversation memory (keyed by user ID when available)
+// 4) Conversation memory
 // ─────────────────────────────────────────────────────────────────────────────
 const SESSIONS = new Map();
 const MAX_HISTORY = 12;
@@ -193,7 +192,6 @@ app.post("/log", auth, (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 const kb = loadKB(path.join(process.cwd(), "kb"));
 
-// We use the Gemini API key here because ingest.js used Google embeddings
 const retriever = createRetriever(kb, {
   geminiApiKey: process.env.GEMINI_API_KEY,
 });
@@ -228,7 +226,7 @@ app.get("/system-prompt-preview", auth, (_req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 6) Chat endpoint (Powered by Gemini 3 Pro)
+// 6) Chat endpoint (Powered by Gemini 3 Pro Preview)
 // ─────────────────────────────────────────────────────────────────────────────
 app.post("/chat", auth, async (req, res) => {
   try {
@@ -277,8 +275,8 @@ app.post("/chat", auth, async (req, res) => {
       };
     });
 
-    // 4. Start Gemini 3 Pro Session
-    // We use "gemini-3-pro" for maximum reasoning capability
+    // 4. Start Gemini 3 Session
+    // We use the constant MODEL_NAME defined at the top
     const model = genAI.getGenerativeModel({ 
       model: MODEL_NAME,
       systemInstruction: finalSystemInstruction 
@@ -301,9 +299,9 @@ app.post("/chat", auth, async (req, res) => {
 
   } catch (e) {
     console.error("❌ /chat error:", e);
-    // Error handling specific to Google API
+    // Explicit error logging for Model Name issues
     if (e.message && e.message.includes("404")) {
-       console.error("⚠️ Model not found. Check if 'gemini-3-pro' is available in your region.");
+       console.error(`⚠️ Model '${MODEL_NAME}' not found. It might be region-locked or retired.`);
     }
     res.status(500).json({ error: "Error connecting to AI backend." });
   }
