@@ -1,18 +1,17 @@
 // server.js
 // Zöld Mentor — secure chat backend with per-session memory + external prompts + KB (RAG)
-// UPDATED: Migrated from OpenAI to Google Gemini for chat generation
+// UPDATED: Now powered by Gemini 3 Pro (The "Smartest" Model)
 
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import rateLimit from "express-rate-limit";
-// We keep OpenAI import because your Retriever likely depends on it for embeddings
-import { GoogleGenerativeAI } from "@google/generative-ai"; // 🆕 Google Import
+import { GoogleGenerativeAI } from "@google/generative-ai"; 
 import fs from "fs";
 import path from "path";
 import zlib from "zlib";
 
-// ⤵️ New imports for the hybrid KB retriever
+// ⤵️ Imports for the hybrid KB retriever
 import { loadKB } from "./lib/kb_loader.js";
 import { createRetriever } from "./lib/retriever.js";
 
@@ -69,14 +68,16 @@ function auth(req, res, next) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 2) AI Clients (Updated)
+// 2) AI Clients (Gemini 3 Pro)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Initialize Google Gemini
+// Initialize Google Gemini Client
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-// We still use the OpenAI API Key string for the Retriever below, 
-// but we don't need the OpenAI 'client' instance for chat generation anymore.
+// We define the model here to check connectivity, but we instantiate per-request in /chat
+// Using "gemini-3-pro" for best reasoning and instruction following.
+// If you ever need to save money/speed, switch this string back to "gemini-2.5-flash"
+const MODEL_NAME = "gemini-3-pro"; 
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 3) External prompt loader
@@ -128,12 +129,6 @@ app.post("/admin/reload-prompts", auth, (_req, res) => {
 const SESSIONS = new Map();
 const MAX_HISTORY = 12;
 
-/**
- * Build a stable conversation key:
- * - if X-User-Id header is present  → use that (global per user)
- * - else if X-Session-Id is present → use that (per browser session)
- * - else fall back to IP-based key  → last resort
- */
 function getConversationKey(req) {
   const userId = req.headers["x-user-id"];
   if (userId) return `user:${userId}`;
@@ -154,7 +149,7 @@ function pushToHistory(convKey, msg) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 4b) Conversation history endpoint (for frontend UI)
+// 4b) Conversation history endpoint
 // ─────────────────────────────────────────────────────────────────────────────
 app.get("/history", auth, (req, res) => {
   try {
@@ -181,7 +176,7 @@ app.get("/history", auth, (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 4c) Lightweight analytics endpoint (optional)
+// 4c) Analytics endpoint
 // ─────────────────────────────────────────────────────────────────────────────
 app.post("/log", auth, (req, res) => {
   try {
@@ -194,12 +189,11 @@ app.post("/log", auth, (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 5) NEW KB SYSTEM — hybrid retriever (replaces old searchKB)
+// 5) NEW KB SYSTEM — hybrid retriever
 // ─────────────────────────────────────────────────────────────────────────────
 const kb = loadKB(path.join(process.cwd(), "kb"));
 
-// ⚠️ Important: The retriever likely still uses OpenAI for embeddings.
-// Ensure OPENAI_API_KEY is still in your .env file.
+// We use the Gemini API key here because ingest.js used Google embeddings
 const retriever = createRetriever(kb, {
   geminiApiKey: process.env.GEMINI_API_KEY,
 });
@@ -221,7 +215,6 @@ app.get("/search/debug", async (req, res) => {
   }
 });
 
-// Optional: KB stats + prompt preview helpers
 app.get("/kb-stats", auth, (_req, res) => {
   res.json({
     ok: true,
@@ -235,7 +228,7 @@ app.get("/system-prompt-preview", auth, (_req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 6) Chat endpoint (Switched to Google Gemini)
+// 6) Chat endpoint (Powered by Gemini 3 Pro)
 // ─────────────────────────────────────────────────────────────────────────────
 app.post("/chat", auth, async (req, res) => {
   try {
@@ -259,11 +252,9 @@ app.post("/chat", auth, async (req, res) => {
     const history = getHistory(convKey);
 
     // 1. Retrieve relevant chunks (Search KB)
-    // We still use the existing retriever here
     const kbHits = await retriever.search(userText, { k: 6 });
     
     // 2. Build System Prompt for Gemini
-    // Google Gemini prefers system instructions to be passed during initialization, not as a message in the list.
     const baseSystemPromptHu = buildSystemPrompt();
     
     let contextBlock = "";
@@ -279,8 +270,6 @@ app.post("/chat", auth, async (req, res) => {
     const finalSystemInstruction = `${baseSystemPromptHu}${contextBlock}`;
 
     // 3. Convert History to Gemini Format
-    // OpenAI: { role: "user"|"assistant", content: "..." }
-    // Gemini: { role: "user"|"model", parts: [{ text: "..." }] }
     const googleHistory = history.map((m) => {
       return {
         role: m.role === "assistant" ? "model" : "user",
@@ -288,16 +277,15 @@ app.post("/chat", auth, async (req, res) => {
       };
     });
 
-    // 4. Start Gemini Chat Session
-    // We use "gemini-1.5-flash" for speed/efficiency. You can change to "gemini-1.5-pro" if needed.
+    // 4. Start Gemini 3 Pro Session
+    // We use "gemini-3-pro" for maximum reasoning capability
     const model = genAI.getGenerativeModel({ 
-      model: "gemini-1.5-flash",
+      model: MODEL_NAME,
       systemInstruction: finalSystemInstruction 
     });
 
     const chatSession = model.startChat({
       history: googleHistory,
-      // generationConfig: { maxOutputTokens: 1000 }, // Optional config
     });
 
     // 5. Send Message
@@ -305,7 +293,7 @@ app.post("/chat", auth, async (req, res) => {
     const response = await result.response;
     const reply = response.text();
 
-    // 6. Save to local history (Using standard format for frontend compatibility)
+    // 6. Save to local history
     pushToHistory(convKey, { role: "user", content: userText });
     pushToHistory(convKey, { role: "assistant", content: reply });
 
@@ -313,9 +301,9 @@ app.post("/chat", auth, async (req, res) => {
 
   } catch (e) {
     console.error("❌ /chat error:", e);
-    // Check if it's a specific Google API error
-    if (e.message && e.message.includes("API key")) {
-      return res.status(500).json({ error: "Invalid or missing Google API Key." });
+    // Error handling specific to Google API
+    if (e.message && e.message.includes("404")) {
+       console.error("⚠️ Model not found. Check if 'gemini-3-pro' is available in your region.");
     }
     res.status(500).json({ error: "Error connecting to AI backend." });
   }
@@ -328,6 +316,7 @@ buildSystemPrompt();
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`✅ Zöld Mentor API listening on port ${PORT} (Powered by Gemini)`);
+  console.log(`✅ Zöld Mentor API listening on port ${PORT}`);
+  console.log(`🧠 AI Brain: ${MODEL_NAME}`);
   console.log(`📂 KB loaded with ${kb.chunks.length} chunks`);
 });
