@@ -1,6 +1,6 @@
 // server.js
 // Zöld Mentor — secure chat backend with per-session memory + external prompts + KB (RAG)
-// UPDATED: Gemini 3 Pro + Firestore + Table Support Instructions
+// UPDATED: Gemini 3 Pro + Firestore + AUTOMATIC Query Translation (No manual synonyms needed)
 
 import express from "express";
 import cors from "cors";
@@ -71,12 +71,15 @@ function auth(req, res, next) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 2) AI Clients (Gemini 3 Pro - Preview)
+// 2) AI Clients
 // ─────────────────────────────────────────────────────────────────────────────
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-// Use the Preview model (Nov 2025 release)
-const MODEL_NAME = "gemini-3-pro-preview"; 
+// 🧠 MAIN BRAIN: Uses the Smartest Model (Preview) for answering
+const CHAT_MODEL_NAME = "gemini-3-pro-preview"; 
+
+// ⚡ TRANSLATOR: Uses the Fastest Model for expanding search terms (Cheap & Fast)
+const SEARCH_HELPER_MODEL = "gemini-2.5-flash";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 3) External prompt loader
@@ -102,7 +105,6 @@ function buildSystemPrompt() {
     }
   } catch (e) {
     console.warn(`[PROMPT] Could not read ${PROMPT_PATH}: ${e.message}`);
-    // 🆕 UPDATED: Explicitly ask for tables in the fallback prompt
     cachedSystemPrompt = cachedSystemPrompt || 
       "Te vagy a Zöld Mentor. Válaszolj magyarul, világosan. Ha összehasonlítást kérnek, használj Markdown táblázatot.";
   }
@@ -119,8 +121,8 @@ app.post("/admin/reload-prompts", auth, (_req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // 4) PERMANENT DATABASE MEMORY (Firestore)
 // ─────────────────────────────────────────────────────────────────────────────
-const MAX_CONTEXT = 12; // Only send last 12 messages to AI (Cheap/Fast)
-const MAX_STORAGE = 50; // Keep last 50 messages in DB (For History Search)
+const MAX_CONTEXT = 12; 
+const MAX_STORAGE = 50; 
 
 function getConversationKey(req) {
   let rawKey = "";
@@ -163,19 +165,9 @@ app.get("/history", auth, async (req, res) => {
   try {
     const convKey = getConversationKey(req);
     const hist = await loadSession(convKey);
-
     const messages = hist
-      .filter(
-        (m) =>
-          m &&
-          typeof m.content === "string" &&
-          (m.role === "user" || m.role === "assistant")
-      )
-      .map((m) => ({
-        who: m.role === "user" ? "user" : "bot",
-        text: m.content,
-      }));
-
+      .filter(m => m && (m.role === "user" || m.role === "assistant"))
+      .map(m => ({ who: m.role === "user" ? "user" : "bot", text: m.content }));
     res.json({ ok: true, messages });
   } catch (e) {
     console.error("❌ /history error:", e);
@@ -192,21 +184,58 @@ app.post("/log", auth, (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 5) KB SYSTEM
+// 5) KB SYSTEM & QUERY EXPANDER (The Magic Step)
 // ─────────────────────────────────────────────────────────────────────────────
 const kb = loadKB(path.join(process.cwd(), "kb"));
 const retriever = createRetriever(kb, { geminiApiKey: process.env.GEMINI_API_KEY });
 
+/**
+ * 🆕 This function uses a fast AI model to translate Hungarian terms 
+ * to English/Latin scientific names BEFORE we search the database.
+ */
+async function expandQueryWithAI(userQuery) {
+  try {
+    const fastModel = genAI.getGenerativeModel({ model: SEARCH_HELPER_MODEL });
+    
+    // We tell the AI strictly to just extract keywords, no chatting.
+    const prompt = `
+      You are a botanical translator for a search engine. 
+      Identify the key herbal/medical terms in this Hungarian query: "${userQuery}".
+      Translate them into English and Latin scientific names.
+      Return ONLY the translated keywords separated by spaces. No sentences.
+    `;
+
+    const result = await fastModel.generateContent(prompt);
+    const keywords = result.response.text().trim();
+    
+    // Combine original query + new English keywords
+    // Example: "Mire jó a körömvirág?" + "Calendula officinalis Marigold"
+    return `${userQuery} ${keywords}`;
+  } catch (e) {
+    console.warn("⚠️ Query expansion failed, using original query:", e.message);
+    return userQuery;
+  }
+}
+
 app.get("/search/debug", async (req, res) => {
   try {
     const q = req.query.q || "calendula";
-    const hits = await retriever.search(q, { k: 6 });
+    // Test the expander logic
+    const expandedQ = await expandQueryWithAI(q);
+    const hits = await retriever.search(expandedQ, { k: 6 });
+    
     const shaped = hits.map((t) => ({
       source: t.source,
       score: Number(t.score.toFixed(4)),
       preview: t.text.length > 180 ? t.text.slice(0, 180) + "…" : t.text,
     }));
-    res.json({ count: shaped.length, results: shaped });
+    
+    res.json({ 
+      original: q,
+      expanded: expandedQ,
+      count: shaped.length, 
+      results: shaped 
+    });
   } catch (e) {
     console.error("❌ /search/debug error:", e.message);
     res.status(500).json({ error: "Search failed" });
@@ -223,7 +252,7 @@ app.get("/system-prompt-preview", auth, (_req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 6) Chat endpoint (Gemini 3 + Firestore Memory)
+// 6) Chat endpoint
 // ─────────────────────────────────────────────────────────────────────────────
 app.post("/chat", auth, async (req, res) => {
   try {
@@ -239,12 +268,14 @@ app.post("/chat", auth, async (req, res) => {
     const userText = lastUser ? String(lastUser.content || "") : "";
     if (!userText) return res.status(400).json({ error: "Missing user message." });
 
-    // 1. Load FULL History from DB
+    // 1. Load History
     const convKey = getConversationKey(req);
     const fullHistory = await loadSession(convKey);
 
-    // 2. Search KB
-    const kbHits = await retriever.search(userText, { k: 6 });
+    // 2. 🆕 EXPAND QUERY & SEARCH KB
+    // This step translates "körömvirág" -> "calendula" silently
+    const expandedQuery = await expandQueryWithAI(userText);
+    const kbHits = await retriever.search(expandedQuery, { k: 6 });
     
     // 3. Build Prompt
     const baseSystemPromptHu = buildSystemPrompt();
@@ -260,9 +291,8 @@ app.post("/chat", auth, async (req, res) => {
 
     const finalSystemInstruction = `${baseSystemPromptHu}${contextBlock}`;
 
-    // 4. Convert History for Gemini (Use only last MAX_CONTEXT messages)
+    // 4. Convert History
     const recentHistory = fullHistory.slice(-MAX_CONTEXT);
-    
     const googleHistory = recentHistory.map((m) => {
       return {
         role: m.role === "assistant" ? "model" : "user",
@@ -272,7 +302,7 @@ app.post("/chat", auth, async (req, res) => {
 
     // 5. Generate Answer
     const model = genAI.getGenerativeModel({ 
-      model: MODEL_NAME,
+      model: CHAT_MODEL_NAME,
       systemInstruction: finalSystemInstruction 
     });
 
@@ -280,22 +310,21 @@ app.post("/chat", auth, async (req, res) => {
     const result = await chatSession.sendMessage(userText);
     const reply = result.response.text();
 
-    // 6. Save NEW History to DB
+    // 6. Save History
     const updatedHistory = [
       ...fullHistory, 
       { role: "user", content: userText }, 
       { role: "assistant", content: reply }
     ];
-
     const historyToSave = updatedHistory.slice(-MAX_STORAGE);
-    saveSession(convKey, historyToSave); // Async save
+    saveSession(convKey, historyToSave);
 
     res.json({ ok: true, answer: reply });
 
   } catch (e) {
     console.error("❌ /chat error:", e);
     if (e.message && e.message.includes("404")) {
-       console.error(`⚠️ Model '${MODEL_NAME}' not found. Check availability.`);
+       console.error(`⚠️ Model '${CHAT_MODEL_NAME}' not found.`);
     }
     res.status(500).json({ error: "Error connecting to AI backend." });
   }
@@ -309,6 +338,7 @@ buildSystemPrompt();
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`✅ Zöld Mentor API listening on port ${PORT}`);
-  console.log(`🧠 AI Brain: ${MODEL_NAME}`);
-  console.log(`💾 Memory: Firestore (Context: ${MAX_CONTEXT}, Storage: ${MAX_STORAGE})`);
+  console.log(`🧠 Main Brain: ${CHAT_MODEL_NAME}`);
+  console.log(`⚡ Translator: ${SEARCH_HELPER_MODEL}`);
+  console.log(`💾 Memory: Firestore`);
 });
