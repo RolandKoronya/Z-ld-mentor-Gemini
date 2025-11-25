@@ -1,6 +1,6 @@
 // server.js
 // Zöld Mentor — secure chat backend with per-session memory + external prompts + KB (RAG)
-// UPDATED: Gemini 3 Pro + Firestore + Extended History for Search
+// UPDATED: Gemini 3 Pro + Firestore + Table Support Instructions
 
 import express from "express";
 import cors from "cors";
@@ -76,7 +76,6 @@ function auth(req, res, next) {
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 // Use the Preview model (Nov 2025 release)
-// Fallback to "gemini-2.5-pro" if preview is unavailable in your region.
 const MODEL_NAME = "gemini-3-pro-preview"; 
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -103,7 +102,9 @@ function buildSystemPrompt() {
     }
   } catch (e) {
     console.warn(`[PROMPT] Could not read ${PROMPT_PATH}: ${e.message}`);
-    cachedSystemPrompt = cachedSystemPrompt || "Te vagy a Zöld Mentor. Válaszolj magyarul, világosan.";
+    // 🆕 UPDATED: Explicitly ask for tables in the fallback prompt
+    cachedSystemPrompt = cachedSystemPrompt || 
+      "Te vagy a Zöld Mentor. Válaszolj magyarul, világosan. Ha összehasonlítást kérnek, használj Markdown táblázatot.";
   }
   return cachedSystemPrompt;
 }
@@ -118,7 +119,6 @@ app.post("/admin/reload-prompts", auth, (_req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // 4) PERMANENT DATABASE MEMORY (Firestore)
 // ─────────────────────────────────────────────────────────────────────────────
-// 🆕 UPDATED LIMITS:
 const MAX_CONTEXT = 12; // Only send last 12 messages to AI (Cheap/Fast)
 const MAX_STORAGE = 50; // Keep last 50 messages in DB (For History Search)
 
@@ -131,7 +131,6 @@ function getConversationKey(req) {
     if (sessionId) rawKey = `session:${sessionId}`;
     else rawKey = `ip:${req.ip || "anon"}`;
   }
-  // Sanitize key for Firestore
   return rawKey.replace(/\//g, "_");
 }
 
@@ -163,7 +162,6 @@ async function saveSession(key, messages) {
 app.get("/history", auth, async (req, res) => {
   try {
     const convKey = getConversationKey(req);
-    // Loads the full 50 stored messages so search works on older items
     const hist = await loadSession(convKey);
 
     const messages = hist
@@ -241,7 +239,7 @@ app.post("/chat", auth, async (req, res) => {
     const userText = lastUser ? String(lastUser.content || "") : "";
     if (!userText) return res.status(400).json({ error: "Missing user message." });
 
-    // 1. Load FULL History from DB (up to 50 messages)
+    // 1. Load FULL History from DB
     const convKey = getConversationKey(req);
     const fullHistory = await loadSession(convKey);
 
@@ -263,7 +261,6 @@ app.post("/chat", auth, async (req, res) => {
     const finalSystemInstruction = `${baseSystemPromptHu}${contextBlock}`;
 
     // 4. Convert History for Gemini (Use only last MAX_CONTEXT messages)
-    // 🆕 Optimization: We only send the last 12 messages to the Brain to save money.
     const recentHistory = fullHistory.slice(-MAX_CONTEXT);
     
     const googleHistory = recentHistory.map((m) => {
@@ -284,7 +281,6 @@ app.post("/chat", auth, async (req, res) => {
     const reply = result.response.text();
 
     // 6. Save NEW History to DB
-    // 🆕 We append to fullHistory, then trim to MAX_STORAGE (50)
     const updatedHistory = [
       ...fullHistory, 
       { role: "user", content: userText }, 
@@ -292,9 +288,7 @@ app.post("/chat", auth, async (req, res) => {
     ];
 
     const historyToSave = updatedHistory.slice(-MAX_STORAGE);
-
-    // Async write (fire and forget) so we don't delay the response
-    saveSession(convKey, historyToSave);
+    saveSession(convKey, historyToSave); // Async save
 
     res.json({ ok: true, answer: reply });
 
