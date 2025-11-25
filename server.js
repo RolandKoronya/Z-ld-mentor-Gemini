@@ -1,6 +1,6 @@
 // server.js
 // Zöld Mentor — secure chat backend with per-session memory + external prompts + KB (RAG)
-// UPDATED: Gemini 3 Pro + Firestore + AUTOMATIC Query Translation (No manual synonyms needed)
+// UPDATED: Fixed Firestore Database Connection Name ('zoldmentor')
 
 import express from "express";
 import cors from "cors";
@@ -24,8 +24,9 @@ const app = express();
 app.set("trust proxy", 1);
 app.use(express.json({ limit: "1mb" }));
 
-// Initialize Firestore (Google's Database)
-const db = new Firestore();
+// 🔧 FIX: Connect to the specific database you created ('zoldmentor')
+// If you ever delete that DB and make a 'default' one, remove the { databaseId } part.
+const db = new Firestore({ databaseId: 'zoldmentor' });
 
 // CORS: only allow your sites
 const allowedOrigins = [
@@ -78,7 +79,7 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 // 🧠 MAIN BRAIN: Uses the Smartest Model (Preview) for answering
 const CHAT_MODEL_NAME = "gemini-3-pro-preview"; 
 
-// ⚡ TRANSLATOR: Uses the Fastest Model for expanding search terms (Cheap & Fast)
+// ⚡ TRANSLATOR: Uses the Fastest Model for expanding search terms
 const SEARCH_HELPER_MODEL = "gemini-2.5-flash";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -184,35 +185,28 @@ app.post("/log", auth, (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 5) KB SYSTEM & QUERY EXPANDER (The Magic Step)
+// 5) KB SYSTEM & QUERY EXPANDER
 // ─────────────────────────────────────────────────────────────────────────────
 const kb = loadKB(path.join(process.cwd(), "kb"));
 const retriever = createRetriever(kb, { geminiApiKey: process.env.GEMINI_API_KEY });
 
 /**
- * 🆕 This function uses a fast AI model to translate Hungarian terms 
- * to English/Latin scientific names BEFORE we search the database.
+ * Uses AI to translate Hungarian terms to English/Latin scientific names
  */
 async function expandQueryWithAI(userQuery) {
   try {
     const fastModel = genAI.getGenerativeModel({ model: SEARCH_HELPER_MODEL });
-    
-    // We tell the AI strictly to just extract keywords, no chatting.
     const prompt = `
-      You are a botanical translator for a search engine. 
-      Identify the key herbal/medical terms in this Hungarian query: "${userQuery}".
+      You are a botanical translator. 
+      Identify key herbal terms in: "${userQuery}".
       Translate them into English and Latin scientific names.
-      Return ONLY the translated keywords separated by spaces. No sentences.
+      Return ONLY keywords separated by spaces.
     `;
-
     const result = await fastModel.generateContent(prompt);
     const keywords = result.response.text().trim();
-    
-    // Combine original query + new English keywords
-    // Example: "Mire jó a körömvirág?" + "Calendula officinalis Marigold"
     return `${userQuery} ${keywords}`;
   } catch (e) {
-    console.warn("⚠️ Query expansion failed, using original query:", e.message);
+    console.warn("⚠️ Query expansion failed:", e.message);
     return userQuery;
   }
 }
@@ -220,7 +214,6 @@ async function expandQueryWithAI(userQuery) {
 app.get("/search/debug", async (req, res) => {
   try {
     const q = req.query.q || "calendula";
-    // Test the expander logic
     const expandedQ = await expandQueryWithAI(q);
     const hits = await retriever.search(expandedQ, { k: 6 });
     
@@ -272,8 +265,7 @@ app.post("/chat", auth, async (req, res) => {
     const convKey = getConversationKey(req);
     const fullHistory = await loadSession(convKey);
 
-    // 2. 🆕 EXPAND QUERY & SEARCH KB
-    // This step translates "körömvirág" -> "calendula" silently
+    // 2. Expand & Search
     const expandedQuery = await expandQueryWithAI(userText);
     const kbHits = await retriever.search(expandedQuery, { k: 6 });
     
@@ -339,6 +331,5 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`✅ Zöld Mentor API listening on port ${PORT}`);
   console.log(`🧠 Main Brain: ${CHAT_MODEL_NAME}`);
-  console.log(`⚡ Translator: ${SEARCH_HELPER_MODEL}`);
-  console.log(`💾 Memory: Firestore`);
+  console.log(`💾 Memory: Firestore (DB: zoldmentor)`);
 });
