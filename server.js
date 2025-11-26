@@ -1,6 +1,6 @@
 // server.js
-// Zöld Mentor — secure chat backend with per-session memory + external prompts + KB (RAG)
-// UPDATED: Fixed Firestore Database Connection Name ('zoldmentor')
+// Zöld Mentor — secure chat backend
+// UPDATED: Adaptive Persona (AI decides length/tone)
 
 import express from "express";
 import cors from "cors";
@@ -11,7 +11,6 @@ import { Firestore } from "@google-cloud/firestore";
 import fs from "fs";
 import path from "path";
 
-// ⤵️ Imports for the hybrid KB retriever
 import { loadKB } from "./lib/kb_loader.js";
 import { createRetriever } from "./lib/retriever.js";
 
@@ -19,16 +18,13 @@ import { createRetriever } from "./lib/retriever.js";
 // 0) Boot
 // ─────────────────────────────────────────────────────────────────────────────
 dotenv.config();
-
 const app = express();
 app.set("trust proxy", 1);
 app.use(express.json({ limit: "1mb" }));
 
-// 🔧 FIX: Connect to the specific database you created ('zoldmentor')
-// If you ever delete that DB and make a 'default' one, remove the { databaseId } part.
+// Connect to 'zoldmentor' database
 const db = new Firestore({ databaseId: 'zoldmentor' });
 
-// CORS: only allow your sites
 const allowedOrigins = [
   "http://localhost:5173",
   "http://localhost:3000",
@@ -38,36 +34,28 @@ const allowedOrigins = [
   "https://www.theherbalconservatory.eu",
 ];
 
-app.use(
-  cors({
-    origin(origin, callback) {
-      if (!origin) return callback(null, true);
-      if (allowedOrigins.includes(origin)) return callback(null, true);
-      return callback(new Error("Not allowed by CORS"));
-    },
-  })
-);
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    return callback(new Error("Not allowed by CORS"));
+  },
+}));
 
-// Rate limit
 const limiter = rateLimit({ windowMs: 60 * 1000, max: 120 });
 app.use(limiter);
 
-// Health check
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 1) Auth
 // ─────────────────────────────────────────────────────────────────────────────
-const PUBLIC_API_TOKEN =
-  process.env.PUBLIC_API_TOKEN || "zoldmentor-demo-1234567890";
+const PUBLIC_API_TOKEN = process.env.PUBLIC_API_TOKEN || "zoldmentor-demo-1234567890";
 
 function auth(req, res, next) {
   const authHeader = req.headers.authorization || "";
-  const bearer = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
-  const alt = req.headers["x-client-token"] || "";
-  const token = bearer || alt;
-  const matches = token && token === PUBLIC_API_TOKEN;
-  if (!matches) return res.status(401).json({ error: "Unauthorized" });
+  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : req.headers["x-client-token"] || "";
+  if (token !== PUBLIC_API_TOKEN) return res.status(401).json({ error: "Unauthorized" });
   return next();
 }
 
@@ -75,26 +63,17 @@ function auth(req, res, next) {
 // 2) AI Clients
 // ─────────────────────────────────────────────────────────────────────────────
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-
-// 🧠 MAIN BRAIN: Uses the Smartest Model (Preview) for answering
 const CHAT_MODEL_NAME = "gemini-3-pro-preview"; 
-
-// ⚡ TRANSLATOR: Uses the Fastest Model for expanding search terms
 const SEARCH_HELPER_MODEL = "gemini-2.5-flash";
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 3) External prompt loader
+// 3) Prompt Loader (Adaptive Fallback)
 // ─────────────────────────────────────────────────────────────────────────────
-const PROMPT_PATH =
-  process.env.PROMPT_PATH ||
-  path.join(process.cwd(), "prompts", "base.hu.md");
-
+const PROMPT_PATH = process.env.PROMPT_PATH || path.join(process.cwd(), "prompts", "base.hu.md");
 let cachedSystemPrompt = null;
 let cachedPromptMtime = 0;
 
-function readFileIfExists(p) {
-  try { return fs.readFileSync(p, "utf8"); } catch { return ""; }
-}
+function readFileIfExists(p) { try { return fs.readFileSync(p, "utf8"); } catch { return ""; } }
 
 function buildSystemPrompt() {
   try {
@@ -102,12 +81,20 @@ function buildSystemPrompt() {
     if (!cachedSystemPrompt || stat.mtimeMs !== cachedPromptMtime) {
       cachedSystemPrompt = readFileIfExists(PROMPT_PATH);
       cachedPromptMtime = stat.mtimeMs;
-      console.log(`[PROMPT] Loaded base.hu.md (${PROMPT_PATH}, ${cachedSystemPrompt.length} chars)`);
+      console.log(`[PROMPT] Loaded base.hu.md (${cachedSystemPrompt.length} chars)`);
     }
   } catch (e) {
-    console.warn(`[PROMPT] Could not read ${PROMPT_PATH}: ${e.message}`);
+    console.warn(`[PROMPT] Info: ${e.message}`);
+    // 🆕 ADAPTIVE DEFAULT PROMPT
     cachedSystemPrompt = cachedSystemPrompt || 
-      "Te vagy a Zöld Mentor. Válaszolj magyarul, világosan. Ha összehasonlítást kérnek, használj Markdown táblázatot.";
+      `Te vagy a Zöld Mentor. 
+      FELADAT: Válaszolj a kérdésekre a megadott tudástár alapján.
+      
+      FONTOS SZABÁLYOK:
+      1. Alkalmazkodj a kérdezőhöz! Ha a kérdés rövid és tényszerű (pl. "Mennyi a dózis?"), légy tömör és precíz.
+      2. Ha a kérdés kifejtős vagy tanácsot kér (pl. "Mit tegyek ha..."), légy oktató jellegű és részletes.
+      3. Ha összehasonlítást kérnek, használj Markdown táblázatot.
+      4. Mindig magyarul válaszolj.`;
   }
   return cachedSystemPrompt;
 }
@@ -115,221 +102,148 @@ function buildSystemPrompt() {
 app.post("/admin/reload-prompts", auth, (_req, res) => {
   cachedSystemPrompt = null;
   cachedPromptMtime = 0;
-  const text = buildSystemPrompt();
-  return res.json({ ok: true, length: text.length });
+  buildSystemPrompt();
+  res.json({ ok: true });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 4) PERMANENT DATABASE MEMORY (Firestore)
+// 4) Memory & History
 // ─────────────────────────────────────────────────────────────────────────────
 const MAX_CONTEXT = 12; 
 const MAX_STORAGE = 50; 
 
 function getConversationKey(req) {
-  let rawKey = "";
   const userId = req.headers["x-user-id"];
-  if (userId) rawKey = `user:${userId}`;
-  else {
-    const sessionId = req.headers["x-session-id"];
-    if (sessionId) rawKey = `session:${sessionId}`;
-    else rawKey = `ip:${req.ip || "anon"}`;
-  }
-  return rawKey.replace(/\//g, "_");
+  if (userId) return `user:${userId}`.replace(/\//g, "_");
+  const sessionId = req.headers["x-session-id"];
+  if (sessionId) return `session:${sessionId}`.replace(/\//g, "_");
+  return `ip:${req.ip || "anon"}`.replace(/\//g, "_");
 }
 
 async function loadSession(key) {
   try {
     const doc = await db.collection("sessions").doc(key).get();
-    if (!doc.exists) return [];
-    return doc.data().messages || [];
-  } catch (e) {
-    console.error("⚠️ Firestore Read Error:", e.message);
-    return [];
-  }
+    return doc.exists ? doc.data().messages || [] : [];
+  } catch (e) { console.error("DB Read Error:", e.message); return []; }
 }
 
 async function saveSession(key, messages) {
   try {
-    await db.collection("sessions").doc(key).set({
-      messages: messages,
-      updatedAt: new Date()
-    });
-  } catch (e) {
-    console.error("⚠️ Firestore Write Error:", e.message);
-  }
+    await db.collection("sessions").doc(key).set({ messages, updatedAt: new Date() });
+  } catch (e) { console.error("DB Write Error:", e.message); }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 4b) Conversation history endpoint
-// ─────────────────────────────────────────────────────────────────────────────
 app.get("/history", auth, async (req, res) => {
   try {
-    const convKey = getConversationKey(req);
-    const hist = await loadSession(convKey);
+    const hist = await loadSession(getConversationKey(req));
     const messages = hist
       .filter(m => m && (m.role === "user" || m.role === "assistant"))
       .map(m => ({ who: m.role === "user" ? "user" : "bot", text: m.content }));
     res.json({ ok: true, messages });
-  } catch (e) {
-    console.error("❌ /history error:", e);
-    res.status(500).json({ ok: false, error: "History fetch failed" });
-  }
+  } catch (e) { res.status(500).json({ ok: false }); }
 });
 
 app.post("/log", auth, (req, res) => {
-  try {
-    const payload = req.body || {};
-    console.log("📈 ZM analytics:", JSON.stringify(payload));
-  } catch (e) { console.warn("⚠️ /log parse error:", e.message); }
+  console.log("📈 Analytics:", JSON.stringify(req.body || {}));
   res.json({ ok: true });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 5) KB SYSTEM & QUERY EXPANDER
+// 5) KB & Search
 // ─────────────────────────────────────────────────────────────────────────────
 const kb = loadKB(path.join(process.cwd(), "kb"));
 const retriever = createRetriever(kb, { geminiApiKey: process.env.GEMINI_API_KEY });
 
-/**
- * Uses AI to translate Hungarian terms to English/Latin scientific names
- */
 async function expandQueryWithAI(userQuery) {
   try {
     const fastModel = genAI.getGenerativeModel({ model: SEARCH_HELPER_MODEL });
-    const prompt = `
-      You are a botanical translator. 
-      Identify key herbal terms in: "${userQuery}".
-      Translate them into English and Latin scientific names.
-      Return ONLY keywords separated by spaces.
-    `;
-    const result = await fastModel.generateContent(prompt);
-    const keywords = result.response.text().trim();
-    return `${userQuery} ${keywords}`;
-  } catch (e) {
-    console.warn("⚠️ Query expansion failed:", e.message);
-    return userQuery;
-  }
+    const result = await fastModel.generateContent(`
+      Identify herbal terms in: "${userQuery}".
+      Translate to English/Latin scientific names.
+      Return ONLY keywords spaces.
+    `);
+    return `${userQuery} ${result.response.text().trim()}`;
+  } catch { return userQuery; }
 }
 
 app.get("/search/debug", async (req, res) => {
   try {
     const q = req.query.q || "calendula";
-    const expandedQ = await expandQueryWithAI(q);
-    const hits = await retriever.search(expandedQ, { k: 6 });
-    
-    const shaped = hits.map((t) => ({
-      source: t.source,
-      score: Number(t.score.toFixed(4)),
-      preview: t.text.length > 180 ? t.text.slice(0, 180) + "…" : t.text,
-    }));
-    
-    res.json({ 
-      original: q,
-      expanded: expandedQ,
-      count: shaped.length, 
-      results: shaped 
-    });
-  } catch (e) {
-    console.error("❌ /search/debug error:", e.message);
-    res.status(500).json({ error: "Search failed" });
-  }
+    const exp = await expandQueryWithAI(q);
+    const hits = await retriever.search(exp, { k: 6 });
+    res.json({ original: q, expanded: exp, results: hits.map(t => ({ source: t.source, score: t.score, preview: t.text.slice(0,180) })) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get("/kb-stats", auth, (_req, res) => {
-  res.json({ ok: true, chunks: kb.chunks ? kb.chunks.length : 0 });
-});
-
-app.get("/system-prompt-preview", auth, (_req, res) => {
-  const text = buildSystemPrompt();
-  res.json({ ok: true, length: text.length });
-});
+app.get("/kb-stats", auth, (_req, res) => res.json({ chunks: kb.chunks.length }));
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 6) Chat endpoint
+// 6) Chat Endpoint (Adaptive)
 // ─────────────────────────────────────────────────────────────────────────────
 app.post("/chat", auth, async (req, res) => {
   try {
     const body = req.body || {};
     let incoming = Array.isArray(body.messages) ? body.messages : [];
-    
-    if (!incoming.length && body.message) {
-      incoming = [{ role: "user", content: String(body.message) }];
-    }
-    if (!incoming.length) return res.status(400).json({ error: "Provide messages." });
+    if (!incoming.length && body.message) incoming = [{ role: "user", content: String(body.message) }];
+    if (!incoming.length) return res.status(400).json({ error: "No message" });
 
     const lastUser = [...incoming].reverse().find((m) => m.role === "user");
-    const userText = lastUser ? String(lastUser.content || "") : "";
-    if (!userText) return res.status(400).json({ error: "Missing user message." });
+    const userText = lastUser ? String(lastUser.content) : "";
+    if (!userText) return res.status(400).json({ error: "Empty message" });
 
-    // 1. Load History
     const convKey = getConversationKey(req);
     const fullHistory = await loadSession(convKey);
 
-    // 2. Expand & Search
+    // 1. Search
     const expandedQuery = await expandQueryWithAI(userText);
     const kbHits = await retriever.search(expandedQuery, { k: 6 });
     
-    // 3. Build Prompt
-    const baseSystemPromptHu = buildSystemPrompt();
+    // 2. Context
     let contextBlock = "";
-    if (kbHits && kbHits.length > 0) {
-      const sourcesText = kbHits
-        .map((h, i) => `#${i + 1} FORRÁS: ${h.source}\n${h.text}`)
-        .join("\n\n---\n\n");
-      contextBlock = `\n\nKONTEKSTUS / TUDÁSTÁR:\n${sourcesText}`;
+    if (kbHits.length > 0) {
+      const sources = kbHits.map((h, i) => `#${i+1} [${h.source}]: ${h.text}`).join("\n\n");
+      contextBlock = `\n\nTUDÁSTÁR ADATOK (Ezekből dolgozz):\n${sources}`;
     } else {
-      contextBlock = "\n\n(Nincs elérhető speciális tudástár-adat ehhez a kérdéshez.)";
+      contextBlock = "\n\n(Nincs találat a tudástárban. Használd az általános gyógynövényes tudásodat, de jelezd, hogy ez nem a tananyag része.)";
     }
 
-    const finalSystemInstruction = `${baseSystemPromptHu}${contextBlock}`;
+    // 3. Instructions (Adaptive)
+    const basePrompt = buildSystemPrompt();
+    // 🆕 Added explicit instruction for adaptability
+    const adaptiveInstruction = `
+    
+    ADAPTÁCIÓS UTASÍTÁS:
+    Elemezd a kérdező szándékát.
+    - Ha definíciót kér, légy rövid.
+    - Ha kifejtést kér, légy részletes.
+    - Ha listát kér, használj felsorolást.
+    `;
 
-    // 4. Convert History
-    const recentHistory = fullHistory.slice(-MAX_CONTEXT);
-    const googleHistory = recentHistory.map((m) => {
-      return {
-        role: m.role === "assistant" ? "model" : "user",
-        parts: [{ text: m.content }],
-      };
-    });
+    const finalInstruction = `${basePrompt}${adaptiveInstruction}${contextBlock}`;
 
-    // 5. Generate Answer
-    const model = genAI.getGenerativeModel({ 
-      model: CHAT_MODEL_NAME,
-      systemInstruction: finalSystemInstruction 
-    });
+    // 4. Chat
+    const recentHistory = fullHistory.slice(-MAX_CONTEXT).map(m => ({
+      role: m.role === "assistant" ? "model" : "user",
+      parts: [{ text: m.content }],
+    }));
 
-    const chatSession = model.startChat({ history: googleHistory });
-    const result = await chatSession.sendMessage(userText);
+    const model = genAI.getGenerativeModel({ model: CHAT_MODEL_NAME, systemInstruction: finalInstruction });
+    const chat = model.startChat({ history: recentHistory });
+    const result = await chat.sendMessage(userText);
     const reply = result.response.text();
 
-    // 6. Save History
-    const updatedHistory = [
-      ...fullHistory, 
-      { role: "user", content: userText }, 
-      { role: "assistant", content: reply }
-    ];
-    const historyToSave = updatedHistory.slice(-MAX_STORAGE);
-    saveSession(convKey, historyToSave);
+    // 5. Save
+    const newHistory = [...fullHistory, { role: "user", content: userText }, { role: "assistant", content: reply }].slice(-MAX_STORAGE);
+    saveSession(convKey, newHistory);
 
     res.json({ ok: true, answer: reply });
 
   } catch (e) {
-    console.error("❌ /chat error:", e);
-    if (e.message && e.message.includes("404")) {
-       console.error(`⚠️ Model '${CHAT_MODEL_NAME}' not found.`);
-    }
-    res.status(500).json({ error: "Error connecting to AI backend." });
+    console.error("Chat Error:", e);
+    res.status(500).json({ error: "Hiba történt a válasz generálásakor." });
   }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 8) Start server
-// ─────────────────────────────────────────────────────────────────────────────
 buildSystemPrompt();
-
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`✅ Zöld Mentor API listening on port ${PORT}`);
-  console.log(`🧠 Main Brain: ${CHAT_MODEL_NAME}`);
-  console.log(`💾 Memory: Firestore (DB: zoldmentor)`);
-});
+app.listen(PORT, () => console.log(`✅ Zöld Mentor Active on ${PORT}`));
