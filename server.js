@@ -1,6 +1,6 @@
 // server.js
 // Zöld Mentor — secure chat backend
-// UPDATED: Adaptive Persona (AI decides length/tone)
+// UPDATED: Supports Image Uploads (Multimodal)
 
 import express from "express";
 import cors from "cors";
@@ -20,7 +20,8 @@ import { createRetriever } from "./lib/retriever.js";
 dotenv.config();
 const app = express();
 app.set("trust proxy", 1);
-app.use(express.json({ limit: "1mb" }));
+// INCREASED LIMIT: Images are big! We need 10MB limit, not 1MB.
+app.use(express.json({ limit: "10mb" })); 
 
 // Connect to 'zoldmentor' database
 const db = new Firestore({ databaseId: 'zoldmentor' });
@@ -42,7 +43,7 @@ app.use(cors({
   },
 }));
 
-const limiter = rateLimit({ windowMs: 60 * 1000, max: 120 });
+const limiter = rateLimit({ windowMs: 60 * 1000, max: 60 }); // Relaxed for images
 app.use(limiter);
 
 app.get("/health", (_req, res) => res.json({ ok: true }));
@@ -67,7 +68,7 @@ const CHAT_MODEL_NAME = "gemini-3-pro-preview";
 const SEARCH_HELPER_MODEL = "gemini-2.5-flash";
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 3) Prompt Loader (Adaptive Fallback)
+// 3) Prompt Loader
 // ─────────────────────────────────────────────────────────────────────────────
 const PROMPT_PATH = process.env.PROMPT_PATH || path.join(process.cwd(), "prompts", "base.hu.md");
 let cachedSystemPrompt = null;
@@ -85,16 +86,11 @@ function buildSystemPrompt() {
     }
   } catch (e) {
     console.warn(`[PROMPT] Info: ${e.message}`);
-    // 🆕 ADAPTIVE DEFAULT PROMPT
     cachedSystemPrompt = cachedSystemPrompt || 
       `Te vagy a Zöld Mentor. 
       FELADAT: Válaszolj a kérdésekre a megadott tudástár alapján.
-      
-      FONTOS SZABÁLYOK:
-      1. Alkalmazkodj a kérdezőhöz! Ha a kérdés rövid és tényszerű (pl. "Mennyi a dózis?"), légy tömör és precíz.
-      2. Ha a kérdés kifejtős vagy tanácsot kér (pl. "Mit tegyek ha..."), légy oktató jellegű és részletes.
-      3. Ha összehasonlítást kérnek, használj Markdown táblázatot.
-      4. Mindig magyarul válaszolj.`;
+      HA KÉPET KAPSZ: Elemzed a képet. Ha növényt látsz, próbáld azonosítani. Ha betegséget látsz, írd le a tüneteket és javasolj gyógynövényes megoldást, de mindig tedd hozzá, hogy "Ez nem orvosi diagnózis".
+      Mindig magyarul válaszolj.`;
   }
   return cachedSystemPrompt;
 }
@@ -178,50 +174,39 @@ app.get("/search/debug", async (req, res) => {
 app.get("/kb-stats", auth, (_req, res) => res.json({ chunks: kb.chunks.length }));
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 6) Chat Endpoint (Adaptive)
+// 6) Chat Endpoint (With Image Support)
 // ─────────────────────────────────────────────────────────────────────────────
 app.post("/chat", auth, async (req, res) => {
   try {
     const body = req.body || {};
-    let incoming = Array.isArray(body.messages) ? body.messages : [];
-    if (!incoming.length && body.message) incoming = [{ role: "user", content: String(body.message) }];
-    if (!incoming.length) return res.status(400).json({ error: "No message" });
+    const userText = body.message || "";
+    const imageBase64 = body.image; // Expecting base64 string (no header)
+    const imageMime = body.mimeType || "image/jpeg";
 
-    const lastUser = [...incoming].reverse().find((m) => m.role === "user");
-    const userText = lastUser ? String(lastUser.content) : "";
-    if (!userText) return res.status(400).json({ error: "Empty message" });
+    if (!userText && !imageBase64) return res.status(400).json({ error: "Empty message" });
 
     const convKey = getConversationKey(req);
     const fullHistory = await loadSession(convKey);
 
-    // 1. Search
-    const expandedQuery = await expandQueryWithAI(userText);
-    const kbHits = await retriever.search(expandedQuery, { k: 6 });
+    // 1. Search KB (only if text exists)
+    let kbHits = [];
+    if (userText.length > 5) {
+        const expandedQuery = await expandQueryWithAI(userText);
+        kbHits = await retriever.search(expandedQuery, { k: 6 });
+    }
     
     // 2. Context
     let contextBlock = "";
     if (kbHits.length > 0) {
       const sources = kbHits.map((h, i) => `#${i+1} [${h.source}]: ${h.text}`).join("\n\n");
       contextBlock = `\n\nTUDÁSTÁR ADATOK (Ezekből dolgozz):\n${sources}`;
-    } else {
-      contextBlock = "\n\n(Nincs találat a tudástárban. Használd az általános gyógynövényes tudásodat, de jelezd, hogy ez nem a tananyag része.)";
     }
 
-    // 3. Instructions (Adaptive)
+    // 3. Instructions
     const basePrompt = buildSystemPrompt();
-    // 🆕 Added explicit instruction for adaptability
-    const adaptiveInstruction = `
-    
-    ADAPTÁCIÓS UTASÍTÁS:
-    Elemezd a kérdező szándékát.
-    - Ha definíciót kér, légy rövid.
-    - Ha kifejtést kér, légy részletes.
-    - Ha listát kér, használj felsorolást.
-    `;
+    const finalInstruction = `${basePrompt}${contextBlock}`;
 
-    const finalInstruction = `${basePrompt}${adaptiveInstruction}${contextBlock}`;
-
-    // 4. Chat
+    // 4. Prepare History for Gemini
     const recentHistory = fullHistory.slice(-MAX_CONTEXT).map(m => ({
       role: m.role === "assistant" ? "model" : "user",
       parts: [{ text: m.content }],
@@ -229,11 +214,26 @@ app.post("/chat", auth, async (req, res) => {
 
     const model = genAI.getGenerativeModel({ model: CHAT_MODEL_NAME, systemInstruction: finalInstruction });
     const chat = model.startChat({ history: recentHistory });
-    const result = await chat.sendMessage(userText);
+
+    // 5. Send Message (Text + Optional Image)
+    let result;
+    if (imageBase64) {
+        // Multimodal message
+        result = await chat.sendMessage([
+            { text: userText || "Mit látsz ezen a képen?" },
+            { inlineData: { mimeType: imageMime, data: imageBase64 } }
+        ]);
+    } else {
+        // Text only message
+        result = await chat.sendMessage(userText);
+    }
+
     const reply = result.response.text();
 
-    // 5. Save
-    const newHistory = [...fullHistory, { role: "user", content: userText }, { role: "assistant", content: reply }].slice(-MAX_STORAGE);
+    // 6. Save to DB (Don't save the huge image string, just a marker)
+    const savedText = imageBase64 ? `[Kép feltöltve] ${userText}` : userText;
+    
+    const newHistory = [...fullHistory, { role: "user", content: savedText }, { role: "assistant", content: reply }].slice(-MAX_STORAGE);
     saveSession(convKey, newHistory);
 
     res.json({ ok: true, answer: reply });
