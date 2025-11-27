@@ -1,6 +1,6 @@
 // server.js
 // Zöld Mentor — secure chat backend
-// UPDATED: Supports Image Uploads (Multimodal)
+// UPDATED: Vision-First Search (Identifies images BEFORE searching KB)
 
 import express from "express";
 import cors from "cors";
@@ -20,7 +20,7 @@ import { createRetriever } from "./lib/retriever.js";
 dotenv.config();
 const app = express();
 app.set("trust proxy", 1);
-// INCREASED LIMIT: Images are big! We need 10MB limit, not 1MB.
+// 10MB limit for images
 app.use(express.json({ limit: "10mb" })); 
 
 // Connect to 'zoldmentor' database
@@ -43,7 +43,7 @@ app.use(cors({
   },
 }));
 
-const limiter = rateLimit({ windowMs: 60 * 1000, max: 60 }); // Relaxed for images
+const limiter = rateLimit({ windowMs: 60 * 1000, max: 60 });
 app.use(limiter);
 
 app.get("/health", (_req, res) => res.json({ ok: true }));
@@ -65,7 +65,7 @@ function auth(req, res, next) {
 // ─────────────────────────────────────────────────────────────────────────────
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const CHAT_MODEL_NAME = "gemini-3-pro-preview"; 
-const SEARCH_HELPER_MODEL = "gemini-2.5-flash";
+const SEARCH_HELPER_MODEL = "gemini-2.5-flash"; // Fast model for keywords
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 3) Prompt Loader
@@ -145,11 +145,12 @@ app.post("/log", auth, (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 5) KB & Search
+// 5) KB & Search (Text + Vision)
 // ─────────────────────────────────────────────────────────────────────────────
 const kb = loadKB(path.join(process.cwd(), "kb"));
 const retriever = createRetriever(kb, { geminiApiKey: process.env.GEMINI_API_KEY });
 
+// A. Text-Only Expansion
 async function expandQueryWithAI(userQuery) {
   try {
     const fastModel = genAI.getGenerativeModel({ model: SEARCH_HELPER_MODEL });
@@ -160,6 +161,23 @@ async function expandQueryWithAI(userQuery) {
     `);
     return `${userQuery} ${result.response.text().trim()}`;
   } catch { return userQuery; }
+}
+
+// B. 🆕 Image-to-Keywords (The "Eyes" for the Librarian)
+async function extractKeywordsFromImage(base64Data, mimeType) {
+    try {
+        const fastModel = genAI.getGenerativeModel({ model: SEARCH_HELPER_MODEL });
+        const result = await fastModel.generateContent([
+            { text: "Identify the plant or main subject in this image. Return ONLY the Hungarian name, English name, and Latin scientific name. No sentences." },
+            { inlineData: { mimeType: mimeType, data: base64Data } }
+        ]);
+        const keywords = result.response.text().trim();
+        console.log("👁️ Vision Search Keywords:", keywords);
+        return keywords;
+    } catch (e) {
+        console.warn("Vision search failed:", e.message);
+        return "";
+    }
 }
 
 app.get("/search/debug", async (req, res) => {
@@ -174,13 +192,13 @@ app.get("/search/debug", async (req, res) => {
 app.get("/kb-stats", auth, (_req, res) => res.json({ chunks: kb.chunks.length }));
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 6) Chat Endpoint (With Image Support)
+// 6) Chat Endpoint
 // ─────────────────────────────────────────────────────────────────────────────
 app.post("/chat", auth, async (req, res) => {
   try {
     const body = req.body || {};
     const userText = body.message || "";
-    const imageBase64 = body.image; // Expecting base64 string (no header)
+    const imageBase64 = body.image; 
     const imageMime = body.mimeType || "image/jpeg";
 
     if (!userText && !imageBase64) return res.status(400).json({ error: "Empty message" });
@@ -188,51 +206,61 @@ app.post("/chat", auth, async (req, res) => {
     const convKey = getConversationKey(req);
     const fullHistory = await loadSession(convKey);
 
-    // 1. Search KB (only if text exists)
-    let kbHits = [];
-    if (userText.length > 5) {
-        const expandedQuery = await expandQueryWithAI(userText);
-        kbHits = await retriever.search(expandedQuery, { k: 6 });
+    // 1. Build Search Query
+    let searchQuery = userText;
+
+    // 🆕 If Image exists, ask AI what it is FIRST, then add to search query
+    if (imageBase64) {
+        const imageKeywords = await extractKeywordsFromImage(imageBase64, imageMime);
+        searchQuery = `${userText} ${imageKeywords}`; // e.g. "Mi ez? Vitex agnus-castus"
     }
     
-    // 2. Context
+    // 2. Search KB (if we have any text or image-keywords)
+    let kbHits = [];
+    if (searchQuery.length > 2) {
+        // Translate Hungarian -> English/Latin if needed
+        const finalSearchTerm = await expandQueryWithAI(searchQuery);
+        kbHits = await retriever.search(finalSearchTerm, { k: 6 });
+    }
+    
+    // 3. Context Building
     let contextBlock = "";
     if (kbHits.length > 0) {
       const sources = kbHits.map((h, i) => `#${i+1} [${h.source}]: ${h.text}`).join("\n\n");
       contextBlock = `\n\nTUDÁSTÁR ADATOK (Ezekből dolgozz):\n${sources}`;
+    } else {
+      contextBlock = "\n\n(Nincs találat a tudástárban.)";
     }
 
-    // 3. Instructions
+    // 4. Instructions
     const basePrompt = buildSystemPrompt();
     const finalInstruction = `${basePrompt}${contextBlock}`;
 
-    // 4. Prepare History for Gemini
+    // 5. History
     const recentHistory = fullHistory.slice(-MAX_CONTEXT).map(m => ({
       role: m.role === "assistant" ? "model" : "user",
       parts: [{ text: m.content }],
     }));
 
+    // 6. Main Brain (Gemini 3 Pro)
     const model = genAI.getGenerativeModel({ model: CHAT_MODEL_NAME, systemInstruction: finalInstruction });
     const chat = model.startChat({ history: recentHistory });
 
-    // 5. Send Message (Text + Optional Image)
+    // 7. Generate
     let result;
     if (imageBase64) {
-        // Multimodal message
         result = await chat.sendMessage([
-            { text: userText || "Mit látsz ezen a képen?" },
+            { text: userText || "Elemzés erről a képről:" },
             { inlineData: { mimeType: imageMime, data: imageBase64 } }
         ]);
     } else {
-        // Text only message
         result = await chat.sendMessage(userText);
     }
 
     const reply = result.response.text();
 
-    // 6. Save to DB (Don't save the huge image string, just a marker)
+    // 8. Save to DB
     const savedText = imageBase64 ? `[Kép feltöltve] ${userText}` : userText;
-    
     const newHistory = [...fullHistory, { role: "user", content: savedText }, { role: "assistant", content: reply }].slice(-MAX_STORAGE);
     saveSession(convKey, newHistory);
 
