@@ -1,6 +1,6 @@
 // server.js
 // Zöld Mentor — secure chat backend
-// UPDATED: Vision-First Search (Identifies images BEFORE searching KB)
+// UPDATED: Context Override (Allows continuing past conversations)
 
 import express from "express";
 import cors from "cors";
@@ -20,10 +20,8 @@ import { createRetriever } from "./lib/retriever.js";
 dotenv.config();
 const app = express();
 app.set("trust proxy", 1);
-// 10MB limit for images
 app.use(express.json({ limit: "10mb" })); 
 
-// Connect to 'zoldmentor' database
 const db = new Firestore({ databaseId: 'zoldmentor' });
 
 const allowedOrigins = [
@@ -65,7 +63,7 @@ function auth(req, res, next) {
 // ─────────────────────────────────────────────────────────────────────────────
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const CHAT_MODEL_NAME = "gemini-3-pro-preview"; 
-const SEARCH_HELPER_MODEL = "gemini-2.5-flash"; // Fast model for keywords
+const SEARCH_HELPER_MODEL = "gemini-2.5-flash";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 3) Prompt Loader
@@ -89,7 +87,6 @@ function buildSystemPrompt() {
     cachedSystemPrompt = cachedSystemPrompt || 
       `Te vagy a Zöld Mentor. 
       FELADAT: Válaszolj a kérdésekre a megadott tudástár alapján.
-      HA KÉPET KAPSZ: Elemzed a képet. Ha növényt látsz, próbáld azonosítani. Ha betegséget látsz, írd le a tüneteket és javasolj gyógynövényes megoldást, de mindig tedd hozzá, hogy "Ez nem orvosi diagnózis".
       Mindig magyarul válaszolj.`;
   }
   return cachedSystemPrompt;
@@ -145,12 +142,11 @@ app.post("/log", auth, (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 5) KB & Search (Text + Vision)
+// 5) KB & Search
 // ─────────────────────────────────────────────────────────────────────────────
 const kb = loadKB(path.join(process.cwd(), "kb"));
 const retriever = createRetriever(kb, { geminiApiKey: process.env.GEMINI_API_KEY });
 
-// A. Text-Only Expansion
 async function expandQueryWithAI(userQuery) {
   try {
     const fastModel = genAI.getGenerativeModel({ model: SEARCH_HELPER_MODEL });
@@ -163,21 +159,15 @@ async function expandQueryWithAI(userQuery) {
   } catch { return userQuery; }
 }
 
-// B. 🆕 Image-to-Keywords (The "Eyes" for the Librarian)
 async function extractKeywordsFromImage(base64Data, mimeType) {
     try {
         const fastModel = genAI.getGenerativeModel({ model: SEARCH_HELPER_MODEL });
         const result = await fastModel.generateContent([
-            { text: "Identify the plant or main subject in this image. Return ONLY the Hungarian name, English name, and Latin scientific name. No sentences." },
+            { text: "Identify the plant or main subject in this image. Return ONLY the Hungarian name, English name, and Latin scientific name." },
             { inlineData: { mimeType: mimeType, data: base64Data } }
         ]);
-        const keywords = result.response.text().trim();
-        console.log("👁️ Vision Search Keywords:", keywords);
-        return keywords;
-    } catch (e) {
-        console.warn("Vision search failed:", e.message);
-        return "";
-    }
+        return result.response.text().trim();
+    } catch (e) { return ""; }
 }
 
 app.get("/search/debug", async (req, res) => {
@@ -192,7 +182,7 @@ app.get("/search/debug", async (req, res) => {
 app.get("/kb-stats", auth, (_req, res) => res.json({ chunks: kb.chunks.length }));
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 6) Chat Endpoint
+// 6) Chat Endpoint (Context Aware)
 // ─────────────────────────────────────────────────────────────────────────────
 app.post("/chat", auth, async (req, res) => {
   try {
@@ -200,53 +190,55 @@ app.post("/chat", auth, async (req, res) => {
     const userText = body.message || "";
     const imageBase64 = body.image; 
     const imageMime = body.mimeType || "image/jpeg";
+    // 🆕 Custom History from Frontend (for continuing old chats)
+    const customHistory = body.history || null;
 
     if (!userText && !imageBase64) return res.status(400).json({ error: "Empty message" });
 
     const convKey = getConversationKey(req);
-    const fullHistory = await loadSession(convKey);
+    const dbHistory = await loadSession(convKey);
+    
+    // Decide which history to use
+    // If frontend sent a specific segment, use that. Otherwise use DB.
+    let activeHistory = customHistory || dbHistory;
 
     // 1. Build Search Query
     let searchQuery = userText;
-
-    // 🆕 If Image exists, ask AI what it is FIRST, then add to search query
     if (imageBase64) {
         const imageKeywords = await extractKeywordsFromImage(imageBase64, imageMime);
-        searchQuery = `${userText} ${imageKeywords}`; // e.g. "Mi ez? Vitex agnus-castus"
+        searchQuery = `${userText} ${imageKeywords}`;
     }
     
-    // 2. Search KB (if we have any text or image-keywords)
+    // 2. Search KB
     let kbHits = [];
     if (searchQuery.length > 2) {
-        // Translate Hungarian -> English/Latin if needed
         const finalSearchTerm = await expandQueryWithAI(searchQuery);
         kbHits = await retriever.search(finalSearchTerm, { k: 6 });
     }
     
-    // 3. Context Building
+    // 3. Context
     let contextBlock = "";
     if (kbHits.length > 0) {
       const sources = kbHits.map((h, i) => `#${i+1} [${h.source}]: ${h.text}`).join("\n\n");
       contextBlock = `\n\nTUDÁSTÁR ADATOK (Ezekből dolgozz):\n${sources}`;
     } else {
-      contextBlock = "\n\n(Nincs találat a tudástárban.)";
+      contextBlock = "\n\n(Nincs találat a tudástárban. Használd az általános tudásodat, de jelezd.)";
     }
 
-    // 4. Instructions
+    // 4. Build Instructions
     const basePrompt = buildSystemPrompt();
     const finalInstruction = `${basePrompt}${contextBlock}`;
 
-    // 5. History
-    const recentHistory = fullHistory.slice(-MAX_CONTEXT).map(m => ({
+    // 5. Prepare Gemini History
+    const recentHistory = activeHistory.slice(-MAX_CONTEXT).map(m => ({
       role: m.role === "assistant" ? "model" : "user",
-      parts: [{ text: m.content }],
+      parts: [{ text: m.content || m.text || "" }], // Handle both 'content' and 'text' keys
     }));
 
-    // 6. Main Brain (Gemini 3 Pro)
     const model = genAI.getGenerativeModel({ model: CHAT_MODEL_NAME, systemInstruction: finalInstruction });
     const chat = model.startChat({ history: recentHistory });
 
-    // 7. Generate
+    // 6. Generate
     let result;
     if (imageBase64) {
         result = await chat.sendMessage([
@@ -259,9 +251,11 @@ app.post("/chat", auth, async (req, res) => {
 
     const reply = result.response.text();
 
-    // 8. Save to DB
+    // 7. Save to DB
+    // We append to the MAIN DB history regardless of what context we used
+    // This keeps a master log of everything the user said
     const savedText = imageBase64 ? `[Kép feltöltve] ${userText}` : userText;
-    const newHistory = [...fullHistory, { role: "user", content: savedText }, { role: "assistant", content: reply }].slice(-MAX_STORAGE);
+    const newHistory = [...dbHistory, { role: "user", content: savedText }, { role: "assistant", content: reply }].slice(-MAX_STORAGE);
     saveSession(convKey, newHistory);
 
     res.json({ ok: true, answer: reply });
