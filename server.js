@@ -229,13 +229,21 @@ app.post("/chat", auth, async (req, res) => {
     const basePrompt = buildSystemPrompt();
     const finalInstruction = `${basePrompt}${contextBlock}`;
 
-    // 5. Prepare Gemini History
-    const recentHistory = activeHistory.slice(-MAX_CONTEXT).map(m => ({
+   // 5. Prepare Gemini History
+    let recentHistory = activeHistory.slice(-MAX_CONTEXT).map(m => ({
       role: m.role === "assistant" ? "model" : "user",
-      parts: [{ text: m.content || m.text || "" }], // Handle both 'content' and 'text' keys
+      parts: [{ text: m.content || m.text || "" }],
     }));
 
+    // 🆕 FIX: Ensure history starts with a 'user' message
+    // If the first message in the slice is from the bot, remove it.
+    while (recentHistory.length > 0 && recentHistory[0].role !== "user") {
+      recentHistory.shift();
+    }
+
     const model = genAI.getGenerativeModel({ model: CHAT_MODEL_NAME, systemInstruction: finalInstruction });
+    
+    // Now startChat will receive a history that definitely starts with a user
     const chat = model.startChat({ history: recentHistory });
 
     // 6. Generate
