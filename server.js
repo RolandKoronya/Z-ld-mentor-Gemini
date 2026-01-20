@@ -1,6 +1,6 @@
 // server.js
 // Zöld Mentor — secure chat backend
-// UPDATED: Context Override (Allows continuing past conversations)
+// UPDATED: Specific Error Handling & Safety Settings
 
 import express from "express";
 import cors from "cors";
@@ -85,9 +85,7 @@ function buildSystemPrompt() {
   } catch (e) {
     console.warn(`[PROMPT] Info: ${e.message}`);
     cachedSystemPrompt = cachedSystemPrompt || 
-      `Te vagy a Zöld Mentor. 
-      FELADAT: Válaszolj a kérdésekre a megadott tudástár alapján.
-      Mindig magyarul válaszolj.`;
+      `Te vagy a Zöld Mentor. FELADAT: Válaszolj a kérdésekre a megadott tudástár alapján. Mindig magyarul válaszolj.`;
   }
   return cachedSystemPrompt;
 }
@@ -170,19 +168,8 @@ async function extractKeywordsFromImage(base64Data, mimeType) {
     } catch (e) { return ""; }
 }
 
-app.get("/search/debug", async (req, res) => {
-  try {
-    const q = req.query.q || "calendula";
-    const exp = await expandQueryWithAI(q);
-    const hits = await retriever.search(exp, { k: 6 });
-    res.json({ original: q, expanded: exp, results: hits.map(t => ({ source: t.source, score: t.score, preview: t.text.slice(0,180) })) });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.get("/kb-stats", auth, (_req, res) => res.json({ chunks: kb.chunks.length }));
-
 // ─────────────────────────────────────────────────────────────────────────────
-// 6) Chat Endpoint (Context Aware)
+// 6) Chat Endpoint (Context Aware & Error Specific)
 // ─────────────────────────────────────────────────────────────────────────────
 app.post("/chat", auth, async (req, res) => {
   try {
@@ -190,16 +177,12 @@ app.post("/chat", auth, async (req, res) => {
     const userText = body.message || "";
     const imageBase64 = body.image; 
     const imageMime = body.mimeType || "image/jpeg";
-    // 🆕 Custom History from Frontend (for continuing old chats)
     const customHistory = body.history || null;
 
     if (!userText && !imageBase64) return res.status(400).json({ error: "Empty message" });
 
     const convKey = getConversationKey(req);
     const dbHistory = await loadSession(convKey);
-    
-    // Decide which history to use
-    // If frontend sent a specific segment, use that. Otherwise use DB.
     let activeHistory = customHistory || dbHistory;
 
     // 1. Build Search Query
@@ -229,21 +212,30 @@ app.post("/chat", auth, async (req, res) => {
     const basePrompt = buildSystemPrompt();
     const finalInstruction = `${basePrompt}${contextBlock}`;
 
-   // 5. Prepare Gemini History
+    // 5. Prepare Gemini History
     let recentHistory = activeHistory.slice(-MAX_CONTEXT).map(m => ({
       role: m.role === "assistant" ? "model" : "user",
       parts: [{ text: m.content || m.text || "" }],
     }));
 
-    // 🆕 FIX: Ensure history starts with a 'user' message
-    // If the first message in the slice is from the bot, remove it.
     while (recentHistory.length > 0 && recentHistory[0].role !== "user") {
       recentHistory.shift();
     }
 
-    const model = genAI.getGenerativeModel({ model: CHAT_MODEL_NAME, systemInstruction: finalInstruction });
+    // 🆕 Safety Settings: Prevent blocking of herbalism content
+    const safetySettings = [
+      { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" },
+      { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_ONLY_HIGH" },
+      { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_ONLY_HIGH" },
+      { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_ONLY_HIGH" },
+    ];
+
+    const model = genAI.getGenerativeModel({ 
+        model: CHAT_MODEL_NAME, 
+        systemInstruction: finalInstruction,
+        safetySettings 
+    });
     
-    // Now startChat will receive a history that definitely starts with a user
     const chat = model.startChat({ history: recentHistory });
 
     // 6. Generate
@@ -260,8 +252,6 @@ app.post("/chat", auth, async (req, res) => {
     const reply = result.response.text();
 
     // 7. Save to DB
-    // We append to the MAIN DB history regardless of what context we used
-    // This keeps a master log of everything the user said
     const savedText = imageBase64 ? `[Kép feltöltve] ${userText}` : userText;
     const newHistory = [...dbHistory, { role: "user", content: savedText }, { role: "assistant", content: reply }].slice(-MAX_STORAGE);
     saveSession(convKey, newHistory);
@@ -269,8 +259,22 @@ app.post("/chat", auth, async (req, res) => {
     res.json({ ok: true, answer: reply });
 
   } catch (e) {
-    console.error("Chat Error:", e);
-    res.status(500).json({ error: "Hiba történt a válasz generálásakor." });
+    // 🆕 Detailed Error Handling
+    console.error("FULL ERROR DETAIL:", e);
+
+    let userFriendlyError = "Hiba történt a válasz generálásakor.";
+
+    if (e.message?.includes("PROHIBITED_CONTENT")) {
+      userFriendlyError = "A választ a biztonsági szűrő blokkolta. Kérlek, fogalmazd meg máshogy a kérdést (kerüld az orvosi diagnózis jellegű kéréseket).";
+    } else if (e.message?.includes("quota") || e.status === 429) {
+      userFriendlyError = "Sajnos elértük a mai ingyenes keretünket. Kérlek, próbáld újra később!";
+    } else if (e.status === 413 || e.message?.toLowerCase().includes("too large")) {
+      userFriendlyError = "A feltöltött kép túl nagy. Kérlek, használj kisebb felbontású fotót (max 10MB).";
+    } else if (e.message?.includes("Safety")) {
+      userFriendlyError = "A tartalom nem felelt meg a biztonsági irányelveknek. Kérlek, próbáld más szavakkal.";
+    }
+
+    res.status(500).json({ error: userFriendlyError });
   }
 });
 
