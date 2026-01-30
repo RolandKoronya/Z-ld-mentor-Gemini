@@ -1,6 +1,6 @@
 // server.js
 // Zöld Mentor — secure chat backend
-// UPDATED: Specific Error Handling, Safety Settings & Permanent User Bio
+// UPDATED: Specific Error Handling, Safety Settings & Permanent User Bio + Profile Endpoints
 
 import express from "express";
 import cors from "cors";
@@ -100,7 +100,6 @@ app.post("/admin/reload-prompts", auth, (_req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // 4) Memory & History
 // ─────────────────────────────────────────────────────────────────────────────
-// 🆕 UPDATED: Increased limits for better short-term memory
 const MAX_CONTEXT = 24; 
 const MAX_STORAGE = 100; 
 
@@ -125,7 +124,6 @@ async function saveSession(key, messages) {
   } catch (e) { console.error("DB Write Error:", e.message); }
 }
 
-// 🆕 UPDATED: Helper functions for permanent User Bio
 async function loadUserProfile(key) {
   try {
     const doc = await db.collection("profiles").doc(key).get();
@@ -146,6 +144,26 @@ async function saveUserProfile(key, bioText) {
     console.error("Profile Write Error:", e.message); 
   }
 }
+
+// 🆕 NEW: Profile Endpoints for the UI
+app.get("/get-profile", auth, async (req, res) => {
+  try {
+    const bio = await loadUserProfile(getConversationKey(req));
+    res.json({ ok: true, bio });
+  } catch (e) {
+    res.status(500).json({ ok: false });
+  }
+});
+
+app.post("/update-profile", auth, async (req, res) => {
+  try {
+    const { bio } = req.body;
+    await saveUserProfile(getConversationKey(req), bio);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false });
+  }
+});
 
 app.get("/history", auth, async (req, res) => {
   try {
@@ -234,7 +252,6 @@ app.post("/chat", auth, async (req, res) => {
     // 4. Build Instructions
     const basePrompt = buildSystemPrompt();
 
-    // 🆕 UPDATED: Fetch and inject User Profile Bio
     const userBio = await loadUserProfile(convKey);
     const bioBlock = userBio ? `\n\nUSER PROFILE (Always remember these facts about the user):\n${userBio}` : "";
 
@@ -250,7 +267,6 @@ app.post("/chat", auth, async (req, res) => {
       recentHistory.shift();
     }
 
-    // Safety Settings: Prevent blocking of herbalism content
     const safetySettings = [
       { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" },
       { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_ONLY_HIGH" },
@@ -284,7 +300,6 @@ app.post("/chat", auth, async (req, res) => {
     const newHistory = [...dbHistory, { role: "user", content: savedText }, { role: "assistant", content: reply }].slice(-MAX_STORAGE);
     saveSession(convKey, newHistory);
 
-    // 🆕 UPDATED: Explicit "Remember This" logic
     if (userText.toLowerCase().includes("jegyezd meg") || userText.toLowerCase().includes("remember this")) {
         const cleanedFact = userText.replace(/remember this|jegyezd meg/gi, "").trim();
         const updatedBio = (userBio ? userBio + "\n" : "") + "- " + cleanedFact;
@@ -294,7 +309,6 @@ app.post("/chat", auth, async (req, res) => {
     res.json({ ok: true, answer: reply });
 
   } catch (e) {
-    // Detailed Error Handling
     console.error("FULL ERROR DETAIL:", e);
 
     let userFriendlyError = "Hiba történt a válasz generálásakor.";
