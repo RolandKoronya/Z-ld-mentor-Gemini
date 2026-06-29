@@ -343,24 +343,31 @@ app.post("/chat", auth, async (req, res) => {
     console.error("FULL ERROR DETAIL:", e);
 
     let userFriendlyError = "Hiba történt a válasz generálásakor.";
+    let statusCode = 500; // Default to standard internal server error
     const errText = (e.message || "").toLowerCase();
 
-    // 🆕 Specific safety catch for literal matching blocks
+    // 🆕 Updated Catch-Block logic to return appropriate HTTP Status Codes instead of forcing 500
     if (errText.includes("recitation") || errText.includes("filtered")) {
       userFriendlyError = "A kérést a rendszer szerzői jogi szűrője korlátozta, mert a válasz túl pontosan egyezett egy külső forrással. Kérlek, próbáld meg kissé átfogalmazni a kérdést!";
+      statusCode = 400; 
     } else if (errText.includes("deadline") || errText.includes("timeout") || errText.includes("exceeded") || e.status === 504) {
       userFriendlyError = "A kérés időtúllépés miatt megszakadt a külső szervereken. Kérlek, próbáld meg újra egy pillanat múlva!";
+      statusCode = 504;
     } else if (errText.includes("prohibited_content")) {
       userFriendlyError = "A választ a biztonsági szűrő blokkolta. Kérlek, fogalmazd meg máshogy a kérdést (kerüld az orvosi diagnózis jellegű kéréseket).";
+      statusCode = 400;
     } else if (errText.includes("quota") || e.status === 429) {
       userFriendlyError = "Sajnos elértük a mai ingyenes keretünket. Kérlek, próbáld újra később!";
+      statusCode = 429;
     } else if (e.status === 413 || errText.includes("too large")) {
       userFriendlyError = "A feltöltött kép túl nagy. Kérlek, használj kisebb felbontású fotót (max 10MB).";
+      statusCode = 413;
     } else if (errText.includes("safety")) {
       userFriendlyError = "A tartalom nem felelt meg a biztonsági irányelveknek. Kérlek, próbáld más szavakkal.";
+      statusCode = 400;
     }
 
-    res.status(500).json({ error: userFriendlyError });
+    res.status(statusCode).json({ error: userFriendlyError });
   }
 });
 

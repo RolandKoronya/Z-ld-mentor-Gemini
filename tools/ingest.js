@@ -1,5 +1,5 @@
 // tools/ingest.js (FAST SHARDING)
-// UPDATED: Now uses Google Gemini for embeddings
+// UPDATED: Now uses Google Gemini for embeddings (gemini-embedding-001)
 import fs from "fs";
 import path from "path";
 import zlib from "zlib";
@@ -9,7 +9,8 @@ const SRC_DIR = path.join(process.cwd(), "kb");
 const OUT_PREFIX = "kb_store-"; // kb_store-000.json.gz, 001, ...
 
 // Tweakables
-const EMB_MODEL = "text-embedding-004"; // Google's model (768-dim)
+// ⬇️ UPDATED: Changed from text-embedding-004 to gemini-embedding-001 ⬇️
+const EMB_MODEL = "gemini-embedding-001"; 
 const CHUNK_SIZE = 900;
 const CHUNK_OVERLAP = 150;
 const DECIMALS = 4;           // round embeddings for smaller files
@@ -51,6 +52,9 @@ function roundEmbedding(arr, decimals = DECIMALS) {
   return arr.map(v => Math.round(v * f) / f);
 }
 
+// Helper to pause execution (to respect rate limits)
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 function gzipJson(obj) {
   const json = JSON.stringify(obj);
   return zlib.gzipSync(Buffer.from(json));
@@ -59,9 +63,6 @@ function gzipJson(obj) {
 function pad(n, width=3) {
   return String(n).padStart(width, "0");
 }
-
-// Helper to pause execution (to respect rate limits)
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function main() {
   const docs = loadTxtFiles();
