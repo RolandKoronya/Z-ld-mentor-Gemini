@@ -81,7 +81,7 @@ function auth(req, res, next) {
 // ─────────────────────────────────────────────────────────────────────────────
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-const CHAT_MODEL_NAME = "gemini-3.1-pro-preview";
+const CHAT_MODEL_NAME = "gemini-2.5-flash";
 const SEARCH_HELPER_MODEL = "gemini-2.5-flash";
 
 // ─────────────────────────────────────────────────────────────────────────────
