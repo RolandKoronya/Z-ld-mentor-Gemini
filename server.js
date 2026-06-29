@@ -1,6 +1,6 @@
 // server.js
 // Zöld Mentor — secure chat backend
-// UPDATED: Safer Cloud Run startup + reduced recitation risk for KB answers
+// TEST VERSION: Cloud Run safe + KB active + Gemini chat history temporarily disabled
 
 import express from "express";
 import cors from "cors";
@@ -63,6 +63,7 @@ const PUBLIC_API_TOKEN =
 
 function auth(req, res, next) {
   const authHeader = req.headers.authorization || "";
+
   const token = authHeader.startsWith("Bearer ")
     ? authHeader.slice(7)
     : req.headers["x-client-token"] || "";
@@ -106,6 +107,7 @@ function buildSystemPrompt() {
     if (!cachedSystemPrompt || stat.mtimeMs !== cachedPromptMtime) {
       cachedSystemPrompt = readFileIfExists(PROMPT_PATH);
       cachedPromptMtime = stat.mtimeMs;
+
       console.log(
         `[PROMPT] Loaded base.hu.md (${cachedSystemPrompt.length} chars)`
       );
@@ -115,7 +117,7 @@ function buildSystemPrompt() {
 
     cachedSystemPrompt =
       cachedSystemPrompt ||
-      `Te vagy a Zöld Mentor. FELADAT: Válaszolj a kérdésekre a megadott tudástár alapján. Mindig magyarul válaszolj.`;
+      `Te vagy a Zöld Mentor. Magyarul válaszolsz. Rövid, gyakorlatias, oktatási jellegű válaszokat adsz a tudástár alapján.`;
   }
 
   return cachedSystemPrompt;
@@ -131,8 +133,12 @@ app.post("/admin/reload-prompts", auth, (_req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // 4) Memory & History
 // ─────────────────────────────────────────────────────────────────────────────
-const MAX_CONTEXT = 24;
 const MAX_STORAGE = 100;
+
+// Step 1 test:
+// Gemini history is temporarily disabled below in /chat.
+// We still keep DB storage and /history endpoint working.
+const DISABLE_GEMINI_HISTORY_FOR_TEST = true;
 
 function getConversationKey(req) {
   const userId = req.headers["x-user-id"];
@@ -237,15 +243,12 @@ app.post("/log", auth, (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // 5) KB & Search
 // ─────────────────────────────────────────────────────────────────────────────
-
-// Important:
-// This is wrapped in try/catch so Cloud Run can still start even if the KB is
-// missing, too large, malformed, or temporarily broken.
 let kb = { chunks: [], inverted: new Map(), avgdl: 0 };
 let retriever = { search: async () => [] };
 
 try {
   kb = loadKB(path.join(process.cwd(), "kb"));
+
   retriever = createRetriever(kb, {
     geminiApiKey: process.env.GEMINI_API_KEY,
   });
@@ -269,7 +272,10 @@ Return ONLY keywords spaces.
 
     return `${userQuery} ${result.response.text().trim()}`;
   } catch (e) {
-    console.warn("[SEARCH] Query expansion failed, using original query:", e.message);
+    console.warn(
+      "[SEARCH] Query expansion failed, using original query:",
+      e.message
+    );
     return userQuery;
   }
 }
@@ -315,7 +321,10 @@ Válaszolj óvatosan, általános ismeretek alapján, és jelezd röviden, hogy 
 
   const sources = kbHits
     .slice(0, 3)
-    .map((h, i) => `#${i + 1} [${h.source || "tudástár"}]: ${safeKbText(h.text)}`)
+    .map(
+      (h, i) =>
+        `#${i + 1} [${h.source || "tudástár"}]: ${safeKbText(h.text)}`
+    )
     .join("\n\n");
 
   return `
@@ -325,8 +334,8 @@ ${sources}
 
 Fontos válaszadási szabályok:
 - Ne idézz a tudástárból.
-- Ne másold a forrás szavait.
-- Ne kövesd a forrás mondatszerkezetét.
+- Ne másold a tudástár szavait.
+- Ne kövesd a tudástár mondatszerkezetét.
 - Ne írj könyvszerű, hosszú bekezdéseket.
 - A választ teljesen saját, természetes magyar megfogalmazásban add.
 - Röviden, gyakorlatiasan, beszélgetős stílusban válaszolj.
@@ -344,7 +353,6 @@ app.post("/chat", auth, async (req, res) => {
     const userText = body.message || "";
     const imageBase64 = body.image;
     const imageMime = body.mimeType || "image/jpeg";
-    const customHistory = body.history || null;
 
     if (!userText && !imageBase64) {
       return res.status(400).json({ error: "Empty message" });
@@ -352,8 +360,17 @@ app.post("/chat", auth, async (req, res) => {
 
     const convKey = getConversationKey(req);
 
+    // Still load DB history so we can keep saving and serving /history.
     const dbHistory = await loadSession(convKey);
-    const activeHistory = customHistory || dbHistory;
+
+    // STEP 1 TEST:
+    // Do not send previous chat history to Gemini.
+    // This isolates whether old conversation history is triggering RECITATION.
+    const activeHistory = DISABLE_GEMINI_HISTORY_FOR_TEST ? [] : dbHistory;
+
+    if (DISABLE_GEMINI_HISTORY_FOR_TEST) {
+      console.log("[HISTORY] Gemini chat history disabled for recitation test.");
+    }
 
     // 1. Build search query
     let searchQuery = userText;
@@ -364,6 +381,7 @@ app.post("/chat", auth, async (req, res) => {
           imageBase64,
           imageMime
         );
+
         searchQuery = `${userText} ${imageKeywords}`.trim();
       } catch (imgErr) {
         console.warn("⚠️ Image keyword extraction bypassed:", imgErr.message);
@@ -377,13 +395,13 @@ app.post("/chat", auth, async (req, res) => {
       try {
         const finalSearchTerm = await expandQueryWithAI(searchQuery);
 
-        // Reduced from 6 to 3 to lower recitation risk.
         kbHits = await retriever.search(finalSearchTerm, { k: 3 });
       } catch (searchError) {
         console.error(
-          "⚠️ KB search or query expansion failed, using fallback knowledge:",
+          "⚠️ KB search or query expansion failed:",
           searchError
         );
+
         kbHits = [];
       }
     }
@@ -413,10 +431,9 @@ Válaszadási forma:
 - Ne hivatkozz arra, hogy "a forrás szerint" vagy "a tudástár szerint", hacsak a felhasználó ezt kifejezetten nem kéri.`;
 
     // 5. Prepare Gemini history
-    const rawHistory = activeHistory.slice(-MAX_CONTEXT);
     const recentHistory = [];
 
-    for (const m of rawHistory) {
+    for (const m of activeHistory) {
       const rawText = m.content || m.text || "";
       const sanitizedText = rawText.trim();
 
@@ -428,7 +445,9 @@ Válaszadási forma:
         recentHistory.length > 0 &&
         recentHistory[recentHistory.length - 1].role === targetRole
       ) {
-        recentHistory[recentHistory.length - 1].parts[0].text += `\n${sanitizedText}`;
+        recentHistory[
+          recentHistory.length - 1
+        ].parts[0].text += `\n${sanitizedText}`;
       } else {
         recentHistory.push({
           role: targetRole,
@@ -460,7 +479,6 @@ Válaszadási forma:
       },
     ];
 
-    // Higher temperature helps avoid source-like recitation.
     const generationConfig = {
       temperature: 1.0,
       topP: 0.95,
