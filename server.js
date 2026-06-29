@@ -1,6 +1,7 @@
 // server.js
 // Zöld Mentor — secure chat backend
-// TEST VERSION: Cloud Run safe + KB active + Gemini chat history temporarily disabled
+// UPDATED: Safer Cloud Run startup + reduced recitation risk for KB answers
+// HISTORY RESTORED: Gemini now uses recent chat history again
 
 import express from "express";
 import cors from "cors";
@@ -133,12 +134,8 @@ app.post("/admin/reload-prompts", auth, (_req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // 4) Memory & History
 // ─────────────────────────────────────────────────────────────────────────────
+const MAX_CONTEXT = 24;
 const MAX_STORAGE = 100;
-
-// Step 1 test:
-// Gemini history is temporarily disabled below in /chat.
-// We still keep DB storage and /history endpoint working.
-const DISABLE_GEMINI_HISTORY_FOR_TEST = true;
 
 function getConversationKey(req) {
   const userId = req.headers["x-user-id"];
@@ -353,6 +350,7 @@ app.post("/chat", auth, async (req, res) => {
     const userText = body.message || "";
     const imageBase64 = body.image;
     const imageMime = body.mimeType || "image/jpeg";
+    const customHistory = body.history || null;
 
     if (!userText && !imageBase64) {
       return res.status(400).json({ error: "Empty message" });
@@ -360,17 +358,8 @@ app.post("/chat", auth, async (req, res) => {
 
     const convKey = getConversationKey(req);
 
-    // Still load DB history so we can keep saving and serving /history.
     const dbHistory = await loadSession(convKey);
-
-    // STEP 1 TEST:
-    // Do not send previous chat history to Gemini.
-    // This isolates whether old conversation history is triggering RECITATION.
-    const activeHistory = DISABLE_GEMINI_HISTORY_FOR_TEST ? [] : dbHistory;
-
-    if (DISABLE_GEMINI_HISTORY_FOR_TEST) {
-      console.log("[HISTORY] Gemini chat history disabled for recitation test.");
-    }
+    const activeHistory = customHistory || dbHistory;
 
     // 1. Build search query
     let searchQuery = userText;
@@ -397,10 +386,7 @@ app.post("/chat", auth, async (req, res) => {
 
         kbHits = await retriever.search(finalSearchTerm, { k: 3 });
       } catch (searchError) {
-        console.error(
-          "⚠️ KB search or query expansion failed:",
-          searchError
-        );
+        console.error("⚠️ KB search or query expansion failed:", searchError);
 
         kbHits = [];
       }
@@ -431,9 +417,10 @@ Válaszadási forma:
 - Ne hivatkozz arra, hogy "a forrás szerint" vagy "a tudástár szerint", hacsak a felhasználó ezt kifejezetten nem kéri.`;
 
     // 5. Prepare Gemini history
+    const rawHistory = activeHistory.slice(-MAX_CONTEXT);
     const recentHistory = [];
 
-    for (const m of activeHistory) {
+    for (const m of rawHistory) {
       const rawText = m.content || m.text || "";
       const sanitizedText = rawText.trim();
 
