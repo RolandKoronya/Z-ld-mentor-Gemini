@@ -1,6 +1,6 @@
 // server.js
 // Zöld Mentor — secure chat backend
-// UPDATED: Advanced History Alternation Normalization for Gemini 3.1 Strict Validation
+// UPDATED: Added Recitation Block Safety Handling & Generation Configurations
 
 import express from "express";
 import cors from "cors";
@@ -266,18 +266,17 @@ app.post("/chat", auth, async (req, res) => {
 
     const finalInstruction = `${basePrompt}${bioBlock}${contextBlock}`;
 
-    // 🆕 5. Prepare Gemini History (Strict Structural Schema Builder)
+    // 5. Prepare Gemini History
     let rawHistory = activeHistory.slice(-MAX_CONTEXT);
     let recentHistory = [];
 
     for (const m of rawHistory) {
       const rawText = m.content || m.text || "";
       const sanitizedText = rawText.trim();
-      if (!sanitizedText) continue; // Drop completely blank messages
+      if (!sanitizedText) continue; 
 
       const targetRole = m.role === "assistant" ? "model" : "user";
 
-      // If the last added message has the SAME role, merge texts to protect strict alternation rule
       if (recentHistory.length > 0 && recentHistory[recentHistory.length - 1].role === targetRole) {
         recentHistory[recentHistory.length - 1].parts[0].text += `\n${sanitizedText}`;
       } else {
@@ -288,7 +287,6 @@ app.post("/chat", auth, async (req, res) => {
       }
     }
 
-    // Make sure the history list strictly initiates with a 'user' turn
     while (recentHistory.length > 0 && recentHistory[0].role !== "user") {
       recentHistory.shift();
     }
@@ -300,10 +298,17 @@ app.post("/chat", auth, async (req, res) => {
       { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_ONLY_HIGH" },
     ];
 
+    // 🆕 Generation configurations to mitigate recitation triggers
+    const generationConfig = {
+      temperature: 0.7, // Higher temperature decreases literal recitation risks
+      topP: 0.95,
+    };
+
     const model = genAI.getGenerativeModel({ 
         model: CHAT_MODEL_NAME, 
         systemInstruction: finalInstruction,
-        safetySettings 
+        safetySettings,
+        generationConfig
     });
     
     const chat = model.startChat({ history: recentHistory });
@@ -340,7 +345,10 @@ app.post("/chat", auth, async (req, res) => {
     let userFriendlyError = "Hiba történt a válasz generálásakor.";
     const errText = (e.message || "").toLowerCase();
 
-    if (errText.includes("deadline") || errText.includes("timeout") || errText.includes("exceeded") || e.status === 504) {
+    // 🆕 Specific safety catch for literal matching blocks
+    if (errText.includes("recitation") || errText.includes("filtered")) {
+      userFriendlyError = "A kérést a rendszer szerzői jogi szűrője korlátozta, mert a válasz túl pontosan egyezett egy külső forrással. Kérlek, próbáld meg kissé átfogalmazni a kérdést!";
+    } else if (errText.includes("deadline") || errText.includes("timeout") || errText.includes("exceeded") || e.status === 504) {
       userFriendlyError = "A kérés időtúllépés miatt megszakadt a külső szervereken. Kérlek, próbáld meg újra egy pillanat múlva!";
     } else if (errText.includes("prohibited_content")) {
       userFriendlyError = "A választ a biztonsági szűrő blokkolta. Kérlek, fogalmazd meg máshogy a kérdést (kerüld az orvosi diagnózis jellegű kéréseket).";
