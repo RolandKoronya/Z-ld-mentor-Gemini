@@ -1,6 +1,6 @@
 // server.js
 // Zöld Mentor — secure chat backend
-// UPDATED: Added Strict History Sanitization for Gemini 3.1 Compliance
+// UPDATED: Advanced History Alternation Normalization for Gemini 3.1 Strict Validation
 
 import express from "express";
 import cors from "cors";
@@ -245,7 +245,7 @@ app.post("/chat", auth, async (req, res) => {
             kbHits = await retriever.search(finalSearchTerm, { k: 6 });
         } catch (searchError) {
             console.error("⚠️ KB search or query expansion stalled, utilizing fallback knowledge:", searchError);
-            kbHits = []; // Graceful fallback
+            kbHits = []; 
         }
     }
     
@@ -266,23 +266,29 @@ app.post("/chat", auth, async (req, res) => {
 
     const finalInstruction = `${basePrompt}${bioBlock}${contextBlock}`;
 
-    // 🆕 5. Prepare Gemini History (Sanitized against strict schema requirements)
-    let recentHistory = activeHistory
-      .slice(-MAX_CONTEXT)
-      .map(m => {
-        const rawText = m.content || m.text || "";
-        const sanitizedText = rawText.trim();
-        
-        // Return structured parts ONLY if valid text exists
-        if (!sanitizedText) return null;
+    // 🆕 5. Prepare Gemini History (Strict Structural Schema Builder)
+    let rawHistory = activeHistory.slice(-MAX_CONTEXT);
+    let recentHistory = [];
 
-        return {
-          role: m.role === "assistant" ? "model" : "user",
+    for (const m of rawHistory) {
+      const rawText = m.content || m.text || "";
+      const sanitizedText = rawText.trim();
+      if (!sanitizedText) continue; // Drop completely blank messages
+
+      const targetRole = m.role === "assistant" ? "model" : "user";
+
+      // If the last added message has the SAME role, merge texts to protect strict alternation rule
+      if (recentHistory.length > 0 && recentHistory[recentHistory.length - 1].role === targetRole) {
+        recentHistory[recentHistory.length - 1].parts[0].text += `\n${sanitizedText}`;
+      } else {
+        recentHistory.push({
+          role: targetRole,
           parts: [{ text: sanitizedText }],
-        };
-      })
-      .filter(Boolean); // Clean out empty array fragments
+        });
+      }
+    }
 
+    // Make sure the history list strictly initiates with a 'user' turn
     while (recentHistory.length > 0 && recentHistory[0].role !== "user") {
       recentHistory.shift();
     }
