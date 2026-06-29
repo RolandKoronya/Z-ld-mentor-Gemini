@@ -1,6 +1,6 @@
 // server.js
 // Zöld Mentor — secure chat backend
-// UPDATED: Added Try/Catch Search Safety Fallbacks & Specific Timeout Handling
+// UPDATED: Added Strict History Sanitization for Gemini 3.1 Compliance
 
 import express from "express";
 import cors from "cors";
@@ -226,7 +226,7 @@ app.post("/chat", auth, async (req, res) => {
     const dbHistory = await loadSession(convKey);
     let activeHistory = customHistory || dbHistory;
 
-    // 🆕 1. Build Search Query (Wrapped in safe fallback)
+    // 1. Build Search Query (Wrapped in safe fallback)
     let searchQuery = userText;
     if (imageBase64) {
         try {
@@ -237,7 +237,7 @@ app.post("/chat", auth, async (req, res) => {
         }
     }
     
-    // 🆕 2. Search KB (Protected with a try/catch to stop execution timeouts)
+    // 2. Search KB (Protected with a try/catch to stop execution timeouts)
     let kbHits = [];
     if (searchQuery.length > 2) {
         try {
@@ -245,7 +245,7 @@ app.post("/chat", auth, async (req, res) => {
             kbHits = await retriever.search(finalSearchTerm, { k: 6 });
         } catch (searchError) {
             console.error("⚠️ KB search or query expansion stalled, utilizing fallback knowledge:", searchError);
-            kbHits = []; // Graceful fallback: Keep moving forward so the user gets an answer!
+            kbHits = []; // Graceful fallback
         }
     }
     
@@ -266,11 +266,22 @@ app.post("/chat", auth, async (req, res) => {
 
     const finalInstruction = `${basePrompt}${bioBlock}${contextBlock}`;
 
-    // 5. Prepare Gemini History
-    let recentHistory = activeHistory.slice(-MAX_CONTEXT).map(m => ({
-      role: m.role === "assistant" ? "model" : "user",
-      parts: [{ text: m.content || m.text || "" }],
-    }));
+    // 🆕 5. Prepare Gemini History (Sanitized against strict schema requirements)
+    let recentHistory = activeHistory
+      .slice(-MAX_CONTEXT)
+      .map(m => {
+        const rawText = m.content || m.text || "";
+        const sanitizedText = rawText.trim();
+        
+        // Return structured parts ONLY if valid text exists
+        if (!sanitizedText) return null;
+
+        return {
+          role: m.role === "assistant" ? "model" : "user",
+          parts: [{ text: sanitizedText }],
+        };
+      })
+      .filter(Boolean); // Clean out empty array fragments
 
     while (recentHistory.length > 0 && recentHistory[0].role !== "user") {
       recentHistory.shift();
@@ -323,7 +334,6 @@ app.post("/chat", auth, async (req, res) => {
     let userFriendlyError = "Hiba történt a válasz generálásakor.";
     const errText = (e.message || "").toLowerCase();
 
-    // 🆕 Upgraded Error Checking for explicit timeouts
     if (errText.includes("deadline") || errText.includes("timeout") || errText.includes("exceeded") || e.status === 504) {
       userFriendlyError = "A kérés időtúllépés miatt megszakadt a külső szervereken. Kérlek, próbáld meg újra egy pillanat múlva!";
     } else if (errText.includes("prohibited_content")) {
