@@ -1,6 +1,6 @@
 // server.js
 // Zöld Mentor — secure chat backend
-// UPDATED: Specific Error Handling, Safety Settings & Permanent User Bio + Profile Endpoints
+// UPDATED: Added Try/Catch Search Safety Fallbacks & Specific Timeout Handling
 
 import express from "express";
 import cors from "cors";
@@ -145,7 +145,7 @@ async function saveUserProfile(key, bioText) {
   }
 }
 
-// 🆕 NEW: Profile Endpoints for the UI
+// Profile Endpoints for the UI
 app.get("/get-profile", auth, async (req, res) => {
   try {
     const bio = await loadUserProfile(getConversationKey(req));
@@ -226,18 +226,27 @@ app.post("/chat", auth, async (req, res) => {
     const dbHistory = await loadSession(convKey);
     let activeHistory = customHistory || dbHistory;
 
-    // 1. Build Search Query
+    // 🆕 1. Build Search Query (Wrapped in safe fallback)
     let searchQuery = userText;
     if (imageBase64) {
-        const imageKeywords = await extractKeywordsFromImage(imageBase64, imageMime);
-        searchQuery = `${userText} ${imageKeywords}`;
+        try {
+            const imageKeywords = await extractKeywordsFromImage(imageBase64, imageMime);
+            searchQuery = `${userText} ${imageKeywords}`;
+        } catch (imgErr) {
+            console.warn("⚠️ Image keyword extraction lagged out, bypassing...", imgErr);
+        }
     }
     
-    // 2. Search KB
+    // 🆕 2. Search KB (Protected with a try/catch to stop execution timeouts)
     let kbHits = [];
     if (searchQuery.length > 2) {
-        const finalSearchTerm = await expandQueryWithAI(searchQuery);
-        kbHits = await retriever.search(finalSearchTerm, { k: 6 });
+        try {
+            const finalSearchTerm = await expandQueryWithAI(searchQuery);
+            kbHits = await retriever.search(finalSearchTerm, { k: 6 });
+        } catch (searchError) {
+            console.error("⚠️ KB search or query expansion stalled, utilizing fallback knowledge:", searchError);
+            kbHits = []; // Graceful fallback: Keep moving forward so the user gets an answer!
+        }
     }
     
     // 3. Context
@@ -312,14 +321,18 @@ app.post("/chat", auth, async (req, res) => {
     console.error("FULL ERROR DETAIL:", e);
 
     let userFriendlyError = "Hiba történt a válasz generálásakor.";
+    const errText = (e.message || "").toLowerCase();
 
-    if (e.message?.includes("PROHIBITED_CONTENT")) {
+    // 🆕 Upgraded Error Checking for explicit timeouts
+    if (errText.includes("deadline") || errText.includes("timeout") || errText.includes("exceeded") || e.status === 504) {
+      userFriendlyError = "A kérés időtúllépés miatt megszakadt a külső szervereken. Kérlek, próbáld meg újra egy pillanat múlva!";
+    } else if (errText.includes("prohibited_content")) {
       userFriendlyError = "A választ a biztonsági szűrő blokkolta. Kérlek, fogalmazd meg máshogy a kérdést (kerüld az orvosi diagnózis jellegű kéréseket).";
-    } else if (e.message?.includes("quota") || e.status === 429) {
+    } else if (errText.includes("quota") || e.status === 429) {
       userFriendlyError = "Sajnos elértük a mai ingyenes keretünket. Kérlek, próbáld újra később!";
-    } else if (e.status === 413 || e.message?.toLowerCase().includes("too large")) {
+    } else if (e.status === 413 || errText.includes("too large")) {
       userFriendlyError = "A feltöltött kép túl nagy. Kérlek, használj kisebb felbontású fotót (max 10MB).";
-    } else if (e.message?.includes("Safety")) {
+    } else if (errText.includes("safety")) {
       userFriendlyError = "A tartalom nem felelt meg a biztonsági irányelveknek. Kérlek, próbáld más szavakkal.";
     }
 
